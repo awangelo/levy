@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>levy: optimal λ-reduction</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>levy</h1>
+      <p>Lévy-optimal λ-reduction on Lambdascope nets, one interaction at a time.</p>
+    </header>
+
+    <main>
+      <section class="source" aria-label="Script">
+        <label for="examples">Example</label>
+        <select id="examples"></select>
+        <label for="script">Script</label>
+        <textarea id="script" spellcheck="false" autocomplete="off"></textarea>
+        <p class="hint">
+          One statement per line: <code>name = term</code> defines, a bare term is reduced.
+          Write <code>\x. body</code> or <code>λx. body</code>; numbers are Church numerals.
+        </p>
+        <button id="load" class="primary">Load</button>
+        <p id="problem" class="problem" role="alert" hidden></p>
+      </section>
+
+      <section class="stage" aria-label="Reduction">
+        <div class="controls">
+          <button id="reset" title="Back to the start">⏮ Reset</button>
+          <button id="back" title="Undo one interaction (←)">◀ Back</button>
+          <button id="step" class="primary" title="Fire one interaction (→)">Step ▶</button>
+          <button id="beta" title="Run until the next β-step has fired (b)">Next β</button>
+          <button id="play" title="Run step by step (space)">Play</button>
+          <button id="finish" title="Run to the normal form">Finish ⏭</button>
+          <label class="speed">Speed <input id="speed" type="range" min="0" max="100" value="55" /></label>
+        </div>
+
+        <div id="canvas" class="canvas">
+          <svg id="net" role="img" aria-label="The interaction net">
+            <g id="wires"></g>
+            <g id="nodes"></g>
+          </svg>
+          <p id="oversize" class="oversize" hidden></p>
+        </div>
+
+        <div class="readout">
+          <div class="term">
+            <h2>Term</h2>
+            <pre id="term"></pre>
+          </div>
+          <div class="next">
+            <h2>Next interaction</h2>
+            <p id="next"></p>
+          </div>
+          <dl class="stats">
+            <div><dt>β-steps</dt><dd id="stat-beta">0</dd></div>
+            <div><dt>Bookkeeping</dt><dd id="stat-bookkeeping">0</dd></div>
+            <div><dt>Nodes</dt><dd id="stat-nodes">0</dd></div>
+            <div><dt>Collected</dt><dd id="stat-collected">0</dd></div>
+          </dl>
+        </div>
+
+        <ul class="legend" aria-label="Legend">
+          <li><span class="swatch lam"></span>λ abstraction</li>
+          <li><span class="swatch app"></span>@ application</li>
+          <li><span class="swatch fan"></span>fan: shares a subterm</li>
+          <li><span class="swatch delim"></span>delimiter: border of a scope</li>
+          <li><span class="swatch port"></span>principal port</li>
+        </ul>
+      </section>
+    </main>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
