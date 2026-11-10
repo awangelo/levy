@@ -280,14 +280,8 @@ fn load(term: &Term, out: &mut Vec<String>) -> Option<Machine> {
     }
 }
 
-/// The term as text, or a summary if it is too large to be worth reading.
 fn show(term: &Term) -> String {
-    let size = term.size();
-    if size > PRINT_LIMIT {
-        format!("<a term of {size} nodes>")
-    } else {
-        term.to_string()
-    }
+    term.abbreviated(PRINT_LIMIT)
 }
 
 fn numeral(term: &Term) -> Option<String> {

@@ -69,6 +69,17 @@ impl Term {
         }
     }
 
+    /// The term as text, or a note of its size if it has more than `limit`
+    /// nodes and so would be too long to be worth reading.
+    pub fn abbreviated(&self, limit: usize) -> String {
+        let size = self.size();
+        if size > limit {
+            format!("<a term of {size} nodes>")
+        } else {
+            self.to_string()
+        }
+    }
+
     /// The names of the free variables, sorted and without repeats.
     pub fn free_names(&self) -> Vec<&str> {
         let mut names = HashSet::new();
@@ -223,6 +234,12 @@ mod tests {
         let b = Term::lam("y", Term::Var(0));
         assert_eq!(a, b);
         assert_ne!(a, Term::lam("x", Term::free("x")));
+    }
+
+    #[test]
+    fn large_terms_are_abbreviated() {
+        assert_eq!(Term::church(2).abbreviated(7), "λf x. f (f x)");
+        assert_eq!(Term::church(2).abbreviated(6), "<a term of 7 nodes>");
     }
 
     #[test]
