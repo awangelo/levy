@@ -6,6 +6,8 @@
 
 mod context;
 pub mod dot;
+pub mod gc;
+pub mod layout;
 pub mod machine;
 pub mod net;
 pub mod parse;
@@ -15,7 +17,7 @@ pub mod script;
 pub mod term;
 pub mod translate;
 
-pub use machine::{Halt, Machine, Stats};
+pub use machine::{Halt, Machine, Redex, Stats};
 pub use parse::{ParseError, parse, parse_with};
 pub use rules::Rule;
 pub use script::{Definitions, Statement};

@@ -17,6 +17,7 @@
 use std::fmt;
 
 use crate::context::Context;
+use crate::gc;
 use crate::net::{Kind, Net, NodeId, Port, Symbol, slot};
 use crate::rules::{self, Rule};
 use crate::term::Term;
@@ -29,6 +30,8 @@ pub struct Stats {
     pub annihilations: u64,
     pub commutations: u64,
     pub dissolutions: u64,
+    /// Nodes removed as garbage.
+    pub collected: u64,
 }
 
 impl Stats {
@@ -72,11 +75,28 @@ impl fmt::Display for Halt {
 
 impl std::error::Error for Halt {}
 
+/// An active pair the reduction is about to rewrite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Redex {
+    /// The node the walk comes from.
+    pub upper: NodeId,
+    /// The node the walk runs into.
+    pub lower: NodeId,
+    pub rule: Rule,
+}
+
+/// The net is collected once it has grown by this factor since last time.
+const GROWTH_BEFORE_COLLECTION: usize = 4;
+/// Nets smaller than this are not worth collecting.
+const SMALLEST_COLLECTION: usize = 4_096;
+
 /// A net under reduction.
 #[derive(Clone, Debug)]
 pub struct Machine {
     net: Net,
     stats: Stats,
+    /// The size at which `normalize` collects garbage next.
+    collect_at: usize,
 }
 
 impl Machine {
@@ -85,6 +105,7 @@ impl Machine {
         Ok(Machine {
             net: translate(term)?,
             stats: Stats::default(),
+            collect_at: SMALLEST_COLLECTION,
         })
     }
 
@@ -121,9 +142,31 @@ impl Machine {
         }
     }
 
+    /// The active pair that `step` would rewrite, or `None` if the net is in
+    /// normal form.
+    pub fn next(&self) -> Result<Option<Redex>, Halt> {
+        let mut scout = Scout {
+            net: &self.net,
+            found: None,
+        };
+        match walk(&mut scout) {
+            Ok(_) | Err(Halt::OutOfFuel) => Ok(scout.found),
+            Err(halt) => Err(halt),
+        }
+    }
+
     /// The term the net stands for right now.
     pub fn readback(&self) -> Result<Term, Halt> {
         readback(&self.net)
+    }
+
+    /// Removes the nodes the result no longer depends on and returns how
+    /// many there were.
+    pub fn collect(&mut self) -> usize {
+        let removed = gc::collect(&mut self.net);
+        self.stats.collected += removed as u64;
+        self.collect_at = (self.net.len() * GROWTH_BEFORE_COLLECTION).max(SMALLEST_COLLECTION);
+        removed
     }
 }
 
@@ -154,6 +197,29 @@ impl Policy for Observe<'_> {
     }
 }
 
+/// Rewrites nothing, and stops at the first pair that could be rewritten: a
+/// reducer with no fuel that remembers what it ran out of fuel for.
+struct Scout<'a> {
+    net: &'a Net,
+    found: Option<Redex>,
+}
+
+impl Policy for Scout<'_> {
+    fn net(&self) -> &Net {
+        self.net
+    }
+
+    fn fire(&mut self, upper: NodeId, lower: NodeId) -> Result<bool, Halt> {
+        match rules::rule_for(self.net.kind(upper), self.net.kind(lower)) {
+            Some(rule) => {
+                self.found = Some(Redex { upper, lower, rule });
+                Err(Halt::OutOfFuel)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
 /// Rewrites every active pair on the way, while the fuel lasts.
 struct Reduce<'a> {
     machine: &'a mut Machine,
@@ -175,6 +241,11 @@ impl Policy for Reduce<'_> {
         if let Some(rule) = rules::apply(net, upper, lower) {
             self.machine.stats.record(rule);
             self.last = Some(rule);
+        }
+        // Everything the walk holds on to is reachable from the root, so
+        // collecting in the middle of it is safe.
+        if self.machine.net.len() >= self.machine.collect_at {
+            self.machine.collect();
         }
         Ok(true)
     }
@@ -406,6 +477,31 @@ mod tests {
         assert_eq!(machine.stats().interactions(), 500);
         assert_eq!(machine.normalize(500), Err(Halt::OutOfFuel));
         assert_eq!(machine.stats().interactions(), 1_000);
+        assert_eq!(machine.net().check(), Ok(()));
+    }
+
+    #[test]
+    fn next_names_the_pair_that_step_rewrites() {
+        let mut machine = machine(r"(\x. x) y");
+        let redex = machine.next().unwrap().expect("the term has a redex");
+        assert_eq!(redex.rule, Rule::Beta);
+        assert_eq!(machine.net().kind(redex.upper), Kind::App);
+        assert!(matches!(machine.net().kind(redex.lower), Kind::Lam { .. }));
+        assert_eq!(machine.step(), Ok(Some(Rule::Beta)));
+        while let Some(redex) = machine.next().unwrap() {
+            assert_eq!(machine.step(), Ok(Some(redex.rule)));
+        }
+        assert_eq!(machine.step(), Ok(None));
+        assert_eq!(machine.readback(), Ok(Term::free("y")));
+    }
+
+    #[test]
+    fn large_garbage_is_collected_along_the_way() {
+        // The discarded argument is big enough to trigger a collection.
+        let mut machine = machine(r"(\x. y) 3000");
+        assert_eq!(machine.normalize(10), Ok(Term::free("y")));
+        assert!(machine.stats().collected > 6_000);
+        assert_eq!(machine.net().len(), 2);
         assert_eq!(machine.net().check(), Ok(()));
     }
 

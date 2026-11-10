@@ -89,12 +89,33 @@ impl Kind {
             Kind::Lam { .. } | Kind::App | Kind::Fan { .. } => 3,
         }
     }
+
+    /// The ports through which a reading of the term goes on after it has
+    /// come into a node of this kind by the port `entered`.
+    ///
+    /// A reading goes down: from an abstraction to its body, from an
+    /// application to its function and argument, and through fans and
+    /// delimiters to whatever lies on their other side. It stops at
+    /// variables. Without a context it cannot tell which branch of a fan to
+    /// take from the shared side, so both are listed.
+    pub fn exits(self, entered: u8) -> &'static [u8] {
+        match (self, entered) {
+            (Kind::Root, _) => &[slot::PRINCIPAL],
+            (Kind::Lam { .. }, slot::PRINCIPAL) => &[slot::BODY],
+            (Kind::App, slot::RESULT) => &[slot::PRINCIPAL, slot::ARG],
+            (Kind::Fan { .. }, slot::PRINCIPAL) => &slot::BRANCHES,
+            (Kind::Delim { .. }, slot::PRINCIPAL) => &[slot::INSIDE],
+            (Kind::Fan { .. } | Kind::Delim { .. }, _) => &[slot::PRINCIPAL],
+            _ => &[],
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct Node {
     kind: Kind,
     links: [Option<Port>; 3],
+    serial: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -110,6 +131,7 @@ pub struct Net {
     vacant: Vec<NodeId>,
     symbols: Symbols,
     root: NodeId,
+    next_serial: u64,
 }
 
 impl Default for Net {
@@ -126,6 +148,7 @@ impl Net {
             vacant: Vec::new(),
             symbols: Symbols::default(),
             root: NodeId(0),
+            next_serial: 0,
         };
         net.root = net.add(Kind::Root);
         net
@@ -164,7 +187,9 @@ impl Net {
         let node = Node {
             kind,
             links: [None; 3],
+            serial: self.next_serial,
         };
+        self.next_serial += 1;
         if let Some(id) = self.vacant.pop() {
             self.cells[id.index()] = Some(node);
             id
@@ -191,6 +216,17 @@ impl Net {
 
     pub fn kind(&self, id: NodeId) -> Kind {
         self.node(id).kind
+    }
+
+    /// A number that tells this node apart from every node the net has ever
+    /// held. Identifiers are reused once a node is removed; serials are not.
+    pub fn serial(&self, id: NodeId) -> u64 {
+        self.node(id).serial
+    }
+
+    /// Whether `id` names a node that is currently in the net.
+    pub fn contains(&self, id: NodeId) -> bool {
+        matches!(self.cells.get(id.index()), Some(Some(_)))
     }
 
     /// The port at the other end of the wire attached to `port`.
@@ -327,6 +363,35 @@ mod tests {
         net.remove(b);
         assert_eq!(net.len(), 2);
         assert_eq!(net.check(), Ok(()));
+    }
+
+    #[test]
+    fn serials_are_never_reused() {
+        let mut net = Net::new();
+        let first = net.add(Kind::Eraser);
+        let serial = net.serial(first);
+        net.remove(first);
+        assert!(!net.contains(first));
+        let second = net.add(Kind::Eraser);
+        assert_eq!(second, first);
+        assert_ne!(net.serial(second), serial);
+    }
+
+    #[test]
+    fn readings_go_down() {
+        let lam = Kind::Lam {
+            name: Net::new().intern("x"),
+        };
+        assert_eq!(lam.exits(slot::PRINCIPAL), [slot::BODY]);
+        assert!(lam.exits(slot::VAR).is_empty());
+        assert_eq!(Kind::App.exits(slot::RESULT), [slot::PRINCIPAL, slot::ARG]);
+        assert_eq!(Kind::Fan { level: 0 }.exits(slot::PRINCIPAL), [1, 2]);
+        assert_eq!(Kind::Fan { level: 0 }.exits(2), [slot::PRINCIPAL]);
+        assert_eq!(
+            Kind::Delim { level: 0 }.exits(slot::INSIDE),
+            [slot::PRINCIPAL]
+        );
+        assert!(Kind::Eraser.exits(slot::PRINCIPAL).is_empty());
     }
 
     #[test]

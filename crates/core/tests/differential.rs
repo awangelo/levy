@@ -248,6 +248,46 @@ fn check_only_beta_changes_the_term() {
     }
 }
 
+#[test]
+fn collecting_garbage_changes_nothing() {
+    with_deep_stack(check_collecting_garbage_changes_nothing);
+}
+
+fn check_collecting_garbage_changes_nothing() {
+    let mut random = Random(0xC0FFEE);
+    let mut sample: Vec<Term> = closed_terms(8).collect();
+    for _ in 0..3_000 {
+        let size = 10 + random.below(30);
+        sample.push(random.term(size, 0, 5));
+    }
+    let mut removed = 0;
+    for term in sample {
+        let mut direct = Machine::new(&term).expect("the term is closed");
+        let Ok(expected) = direct.normalize(20_000) else {
+            continue;
+        };
+        // The same reduction, with a collection after every interaction.
+        let mut stepped = Machine::new(&term).expect("the term is closed");
+        while let Some(rule) = stepped
+            .step()
+            .unwrap_or_else(|halt| panic!("{term}: {halt}"))
+        {
+            stepped.collect();
+            assert_eq!(stepped.net().check(), Ok(()), "{term}: after {rule:?}");
+        }
+        assert_eq!(stepped.readback(), Ok(expected), "{term}");
+        assert_eq!(stepped.stats().beta, direct.stats().beta, "{term}");
+        assert_eq!(
+            stepped.stats().interactions(),
+            direct.stats().interactions(),
+            "{term}"
+        );
+        removed += stepped.stats().collected;
+    }
+    println!("collected {removed} nodes");
+    assert!(removed > 0, "no term left garbage behind");
+}
+
 /// Definitions shared by the corpus, in dependency order.
 const PRELUDE: [(&str, &str); 14] = [
     ("id", r"\x. x"),
