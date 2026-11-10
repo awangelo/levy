@@ -56,6 +56,12 @@ pub fn parse_with(
     }
 }
 
+/// Whether `text` can be used as a name.
+pub fn is_name(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(is_name_start) && chars.all(is_name_part)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
     Lambda,
@@ -310,6 +316,16 @@ mod tests {
         ] {
             let term = parse(source).unwrap();
             assert_eq!(parse(&term.to_string()).unwrap(), term, "{source}");
+        }
+    }
+
+    #[test]
+    fn recognizes_names() {
+        for name in ["x", "x1", "_tmp", "f'", "número"] {
+            assert!(is_name(name), "{name}");
+        }
+        for text in ["", "1x", "a b", "λ", "x.y", "'"] {
+            assert!(!is_name(text), "{text}");
         }
     }
 

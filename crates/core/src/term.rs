@@ -69,6 +69,15 @@ impl Term {
         }
     }
 
+    /// The names of the free variables, sorted and without repeats.
+    pub fn free_names(&self) -> Vec<&str> {
+        let mut names = HashSet::new();
+        self.collect_free_names(&mut names);
+        let mut names: Vec<&str> = names.into_iter().collect();
+        names.sort_unstable();
+        names
+    }
+
     fn collect_free_names<'a>(&'a self, names: &mut HashSet<&'a str>) {
         match self {
             Term::Var(_) => {}
@@ -214,6 +223,16 @@ mod tests {
         let b = Term::lam("y", Term::Var(0));
         assert_eq!(a, b);
         assert_ne!(a, Term::lam("x", Term::free("x")));
+    }
+
+    #[test]
+    fn lists_free_names() {
+        let term = Term::app(
+            Term::lam("x", Term::app(Term::free("b"), Term::Var(0))),
+            Term::app(Term::free("a"), Term::free("b")),
+        );
+        assert_eq!(term.free_names(), ["a", "b"]);
+        assert!(Term::church(2).free_names().is_empty());
     }
 
     #[test]
