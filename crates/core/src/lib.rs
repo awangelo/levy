@@ -4,12 +4,17 @@
 //! Looij and Zwitserlood, 2004), reduced there with a leftmost-outermost
 //! strategy, and read back as terms.
 
+mod context;
 pub mod dot;
+pub mod machine;
 pub mod net;
 pub mod parse;
 pub mod reference;
+pub mod rules;
 pub mod term;
 pub mod translate;
 
+pub use machine::{Halt, Machine, Stats};
 pub use parse::{ParseError, parse, parse_with};
+pub use rules::Rule;
 pub use term::Term;
