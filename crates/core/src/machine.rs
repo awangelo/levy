@@ -205,7 +205,7 @@ enum Head {
 
 struct Walker<'a, P> {
     policy: &'a mut P,
-    /// The abstractions around the current position, innermost last.
+    /// The abstractions around the current position, outermost first.
     binders: Vec<NodeId>,
 }
 
@@ -278,19 +278,22 @@ impl<P: Policy> Walker<'_, P> {
         let mut term = match head {
             Head::Lam(node, name) => {
                 let name = self.policy.net().name(name).to_owned();
+                let context = top.context.enter_abstraction(self.binders.len());
                 self.binders.push(node);
-                let body = self.term(node.port(slot::BODY), top.context.enter_abstraction())?;
+                let body = self.term(node.port(slot::BODY), context)?;
                 self.binders.pop();
                 Term::lam(name, body)
             }
             Head::Bound(node) => {
-                let index = self
-                    .binders
-                    .iter()
-                    .rev()
-                    .position(|&binder| binder == node)
+                // A shared abstraction can occur inside a copy of itself, so
+                // the node alone does not say which copy binds the variable.
+                // The scope the walk is in does.
+                let binder = top
+                    .context
+                    .binder()
+                    .filter(|&binder| self.binders.get(binder) == Some(&node))
                     .ok_or(Halt::Malformed("a variable occurs outside its binder"))?;
-                Term::Var(index)
+                Term::Var(self.binders.len() - 1 - binder)
             }
             Head::Free(name) => Term::free(self.policy.net().name(name)),
         };
@@ -383,6 +386,17 @@ mod tests {
         let expected = parse("f a a").unwrap();
         assert_eq!(machine.normalize(1_000), Ok(expected));
         assert_eq!(machine.stats().beta, 2);
+    }
+
+    #[test]
+    fn a_shared_abstraction_can_occur_inside_itself() {
+        // `g` is applied to a copy of the abstraction it lives in, so the
+        // node for `λy` ends up nested inside itself, once per copy. Each
+        // variable must find the copy that binds it.
+        assert_eq!(
+            normal_form(r"\x. (\f. f f) (\g. x (\y. g y))"),
+            parse(r"\x. x (\y. x (\z. y z))").unwrap()
+        );
     }
 
     #[test]

@@ -7,7 +7,8 @@
 //!
 //! - passing a fan from a branch towards its shared side records which branch
 //!   was taken, and passing one the other way recalls it;
-//! - entering an abstraction opens a fresh innermost scope;
+//! - entering an abstraction opens a fresh innermost scope, tagged with the
+//!   abstraction so that its variable can later tell which copy it belongs to;
 //! - leaving through a delimiter closes the scope at its level and suspends
 //!   it in the scope around, and entering through a delimiter resumes the
 //!   scope suspended last, or opens a fresh one if there is none.
@@ -64,11 +65,19 @@ impl<T: Clone> Stack<T> {
             .as_ref()
             .map(|link| (link.head.clone(), link.tail.clone()))
     }
+
+    fn top(&self) -> Option<&T> {
+        self.0.as_ref().map(|link| &link.head)
+    }
 }
 
 /// What the walk remembers about one scope.
 #[derive(Clone, Debug, Default)]
 struct Scope {
+    /// The abstraction whose body this scope is, as the number of
+    /// abstractions around it in the term being read. Scopes opened by
+    /// delimiters have none.
+    binder: Option<usize>,
     /// Fan branches taken at this level, most recent first.
     branches: Stack<u8>,
     /// Scopes directly inside this one that the walk has left, most recent
@@ -104,11 +113,22 @@ impl Context {
         Context { scopes }
     }
 
-    /// Opens a fresh innermost scope, for the body of an abstraction.
-    pub fn enter_abstraction(&self) -> Context {
+    /// Opens a fresh innermost scope for the body of an abstraction that has
+    /// `binder` abstractions around it.
+    pub fn enter_abstraction(&self, binder: usize) -> Context {
+        let scope = Scope {
+            binder: Some(binder),
+            ..Scope::default()
+        };
         Context {
-            scopes: self.scopes.push(Scope::default()),
+            scopes: self.scopes.push(scope),
         }
+    }
+
+    /// The abstraction whose body is the innermost scope, if that scope was
+    /// opened by one.
+    pub fn binder(&self) -> Option<usize> {
+        self.scopes.top().and_then(|scope| scope.binder)
     }
 
     /// Records the branch by which the walk came into a fan of this level.
@@ -183,9 +203,24 @@ mod tests {
 
     #[test]
     fn abstractions_shift_outer_scopes() {
-        let context = Context::default().take_branch(0, 1).enter_abstraction();
+        let context = Context::default().take_branch(0, 1).enter_abstraction(0);
         assert_eq!(drain(context.clone(), 0), []);
         assert_eq!(drain(context, 1), [1]);
+    }
+
+    #[test]
+    fn scopes_remember_their_abstraction() {
+        let context = Context::default().enter_abstraction(0);
+        assert_eq!(context.binder(), Some(0));
+        let inner = context.take_branch(0, 1).enter_abstraction(1);
+        assert_eq!(inner.binder(), Some(1));
+        // Leaving the inner scope brings the outer abstraction back in view,
+        // and coming back restores the inner one.
+        assert_eq!(inner.leave_scope(0).binder(), Some(0));
+        assert_eq!(inner.leave_scope(0).enter_scope(0).binder(), Some(1));
+        // A scope opened by a delimiter belongs to no abstraction.
+        assert_eq!(context.enter_scope(0).binder(), None);
+        assert_eq!(Context::default().binder(), None);
     }
 
     #[test]

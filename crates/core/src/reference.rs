@@ -199,23 +199,42 @@ impl Reducer {
 
     /// Contracts head redexes until the term is an abstraction or is stuck on
     /// a variable.
-    fn head_normalize(&mut self, mut term: Labelled) -> Result<Labelled, BudgetExhausted> {
+    fn head_normalize(&mut self, term: Labelled) -> Result<Labelled, BudgetExhausted> {
+        // The applications above the head, outermost first, each as its label
+        // and its argument.
+        let mut spine: Vec<(Label, Box<Labelled>)> = Vec::new();
+        let mut head = term;
         loop {
-            let Shape::App(func, arg) = term.shape else {
-                return Ok(term);
+            head = match head.shape {
+                Shape::App(func, arg) => {
+                    spine.push((head.label, arg));
+                    *func
+                }
+                Shape::Lam(name, body) => {
+                    let Some((label, arg)) = spine.pop() else {
+                        head.shape = Shape::Lam(name, body);
+                        break;
+                    };
+                    self.spend()?;
+                    self.beta_steps += 1;
+                    self.degrees.insert(head.label);
+                    let mut result = self.substitute(*body, 0, &arg, head.label.underlined())?;
+                    result.label = label.then(head.label.overlined()).then(result.label);
+                    result
+                }
+                leaf => {
+                    head.shape = leaf;
+                    break;
+                }
             };
-            let func = self.head_normalize(*func)?;
-            let Shape::Lam(_, body) = func.shape else {
-                term.shape = Shape::App(Box::new(func), arg);
-                return Ok(term);
-            };
-            self.spend()?;
-            self.beta_steps += 1;
-            self.degrees.insert(func.label);
-            let mut result = self.substitute(*body, 0, &arg, func.label.underlined())?;
-            result.label = term.label.then(func.label.overlined()).then(result.label);
-            term = result;
         }
+        Ok(spine
+            .into_iter()
+            .rev()
+            .fold(head, |func, (label, arg)| Labelled {
+                label,
+                shape: Shape::App(Box::new(func), arg),
+            }))
     }
 
     /// Replaces the variable bound `depth` binders up by `arg`, whose label
