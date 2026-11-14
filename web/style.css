@@ -195,6 +195,12 @@ button.primary {
   width: 100%;
   height: 100%;
   display: block;
+  cursor: grab;
+  touch-action: none;
+}
+
+.canvas svg.dragging {
+  cursor: grabbing;
 }
 
 .oversize {

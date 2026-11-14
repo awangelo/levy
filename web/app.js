@@ -52,6 +52,7 @@ const ui = {
   beta: $("beta"),
   play: $("play"),
   finish: $("finish"),
+  fit: $("fit"),
   speed: $("speed"),
   net: $("net"),
   wires: $("wires"),
@@ -70,6 +71,7 @@ let frame = null; // the frame on screen
 let drawn = { nodes: [], wires: [] }; // its SVG elements
 let positions = new Map(); // node id -> where it is drawn right now
 let view = null; // the viewBox right now
+let following = true; // whether the view keeps the whole net in sight
 let animation = 0; // identifies the running animation; bumping it cancels
 let timer = null; // set while playing
 
@@ -266,7 +268,8 @@ function draw(next, animate, spawn) {
   const targets = new Map(next.nodes.map((node) => [node.id, { x: node.column * COLUMN, y: node.row * ROW }]));
   const starts = new Map();
   for (const [id, target] of targets) starts.set(id, positions.get(id) ?? spawn ?? target);
-  const viewTarget = boundsOf(targets.values());
+  // Once the reader has zoomed or panned, the view stays where they put it.
+  const viewTarget = following || !view ? boundsOf(targets.values()) : view;
   const viewStart = view ?? viewTarget;
 
   const token = ++animation;
@@ -274,7 +277,8 @@ function draw(next, animate, spawn) {
   const began = performance.now();
   const tick = (now) => {
     if (token !== animation) return;
-    const t = length > 0 ? Math.min(1, (now - began) / length) : 1;
+    // A frame's timestamp can predate `began`, hence the lower bound.
+    const t = length > 0 ? Math.min(1, Math.max(0, (now - began) / length)) : 1;
     const e = ease(t);
     const at = new Map();
     for (const [id, target] of targets) {
@@ -283,16 +287,65 @@ function draw(next, animate, spawn) {
     }
     positions = at;
     place(at);
-    view = {
-      x: mix(viewStart.x, viewTarget.x, e),
-      y: mix(viewStart.y, viewTarget.y, e),
-      w: mix(viewStart.w, viewTarget.w, e),
-      h: mix(viewStart.h, viewTarget.h, e),
-    };
-    ui.net.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
+    if (following || !view) {
+      view = {
+        x: mix(viewStart.x, viewTarget.x, e),
+        y: mix(viewStart.y, viewTarget.y, e),
+        w: mix(viewStart.w, viewTarget.w, e),
+        h: mix(viewStart.h, viewTarget.h, e),
+      };
+      applyView();
+    }
     if (t < 1) requestAnimationFrame(tick);
   };
   tick(began);
+}
+
+function applyView() {
+  ui.net.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
+}
+
+// Zooms around the pointer: the point under it stays where it is.
+function zoom(event) {
+  if (!view) return;
+  event.preventDefault();
+  const pointer = new DOMPoint(event.clientX, event.clientY).matrixTransform(ui.net.getScreenCTM().inverse());
+  const factor = Math.exp(event.deltaY * 0.0015);
+  following = false;
+  view = {
+    x: pointer.x - (pointer.x - view.x) * factor,
+    y: pointer.y - (pointer.y - view.y) * factor,
+    w: view.w * factor,
+    h: view.h * factor,
+  };
+  applyView();
+}
+
+let dragged = null; // where the pointer was, while it drags the net
+
+function pan(event) {
+  if (!dragged || !view) return;
+  // The net is scaled to fit the canvas in both directions, so one screen
+  // pixel is this many units of the viewBox.
+  const scale = Math.max(view.w / ui.net.clientWidth, view.h / ui.net.clientHeight);
+  following = false;
+  view = {
+    ...view,
+    x: view.x - (event.clientX - dragged.x) * scale,
+    y: view.y - (event.clientY - dragged.y) * scale,
+  };
+  dragged = { x: event.clientX, y: event.clientY };
+  applyView();
+}
+
+function release() {
+  dragged = null;
+  ui.net.classList.remove("dragging");
+}
+
+function fit() {
+  following = true;
+  if (frame) draw(frame, true, null);
 }
 
 function readout() {
@@ -385,6 +438,7 @@ function load() {
   problem(null);
   positions = new Map();
   view = null;
+  following = true;
   show(false, null);
 }
 
@@ -407,6 +461,17 @@ ui.finish.addEventListener("click", () => (stop(), advance(() => true)));
 ui.play.addEventListener("click", play);
 ui.back.addEventListener("click", back);
 ui.reset.addEventListener("click", reset);
+ui.fit.addEventListener("click", fit);
+
+ui.net.addEventListener("wheel", zoom, { passive: false });
+ui.net.addEventListener("pointerdown", (event) => {
+  dragged = { x: event.clientX, y: event.clientY };
+  ui.net.setPointerCapture(event.pointerId);
+  ui.net.classList.add("dragging");
+});
+ui.net.addEventListener("pointermove", pan);
+ui.net.addEventListener("pointerup", release);
+ui.net.addEventListener("pointercancel", release);
 
 ui.examples.addEventListener("change", () => {
   ui.script.value = EXAMPLES[Number(ui.examples.value)][1];
@@ -414,8 +479,10 @@ ui.examples.addEventListener("change", () => {
 });
 
 document.addEventListener("keydown", (event) => {
-  if (event.target.closest("textarea, select, input, button")) return;
-  const actions = { ArrowRight: () => ui.step.click(), ArrowLeft: back, " ": play, b: () => ui.beta.click() };
+  // Leave typing alone, and let space press whichever button has the focus.
+  if (event.target.closest("textarea, select, input")) return;
+  if (event.key === " " && event.target.closest("button")) return;
+  const actions = { ArrowRight: () => ui.step.click(), ArrowLeft: back, " ": play, b: () => ui.beta.click(), f: fit };
   const action = actions[event.key];
   if (action) {
     event.preventDefault();
