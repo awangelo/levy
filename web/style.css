@@ -272,6 +272,12 @@ button.primary {
   font-size: 11px;
 }
 
+.node.delim text.height {
+  font-size: 10px;
+  fill: var(--delim);
+  text-anchor: start;
+}
+
 .node.eraser .shape,
 .node.free .shape {
   stroke: var(--wire);

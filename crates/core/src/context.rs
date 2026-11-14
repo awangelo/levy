@@ -157,6 +157,17 @@ impl Context {
         Context::join(inner, rest.push(around))
     }
 
+    /// Closes `count` scopes in a row at this level, as a stack of that many
+    /// delimiters does.
+    pub fn leave_scopes(&self, level: u32, count: u32) -> Context {
+        (0..count).fold(self.clone(), |context, _| context.leave_scope(level))
+    }
+
+    /// Reopens `count` scopes in a row at this level.
+    pub fn enter_scopes(&self, level: u32, count: u32) -> Context {
+        (0..count).fold(self.clone(), |context, _| context.enter_scope(level))
+    }
+
     /// Reopens at this level the scope suspended last, or a fresh one.
     pub fn enter_scope(&self, level: u32) -> Context {
         let (inner, rest) = self.split(level);
@@ -253,6 +264,21 @@ mod tests {
             .enter_scope(0);
         assert_eq!(drain(context.clone(), 0), [1]);
         assert_eq!(drain(context, 1), [2]);
+    }
+
+    #[test]
+    fn stacks_of_scopes_open_and_close_together() {
+        let inside = Context::default()
+            .take_branch(0, 1)
+            .enter_abstraction(0)
+            .take_branch(0, 2)
+            .enter_abstraction(1);
+        let outside = inside.leave_scopes(0, 2);
+        assert_eq!(outside.binder(), None);
+        let back = outside.enter_scopes(0, 2);
+        assert_eq!(back.binder(), Some(1));
+        assert_eq!(drain(back.clone(), 1), [2]);
+        assert_eq!(drain(back, 2), [1]);
     }
 
     #[test]

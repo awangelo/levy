@@ -2,9 +2,9 @@
 //!
 //! Abstractions and applications become nodes of the same name. A variable
 //! occurrence becomes a wire to the variable port of its binder. On the way
-//! it leaves the scope of every abstraction in between, and each such exit is
-//! marked by a delimiter. A variable that occurs several times is shared by a
-//! tree of fans, and one that never occurs is plugged with an eraser.
+//! it leaves the scope of every abstraction in between, and a delimiter marks
+//! how many scopes that is. A variable that occurs several times is shared by
+//! a tree of fans, and one that never occurs is plugged with an eraser.
 
 use std::fmt;
 
@@ -51,12 +51,17 @@ impl Builder {
                     .len()
                     .checked_sub(index + 1)
                     .ok_or(UnboundIndex(*index))?;
-                let mut port = parent;
-                for _ in 0..*index {
-                    let delimiter = self.net.add(Kind::Delim { level: 0 });
-                    self.net.link(delimiter.port(slot::INSIDE), port);
-                    port = delimiter.principal();
-                }
+                let crossed = u32::try_from(*index).map_err(|_| UnboundIndex(*index))?;
+                let port = if crossed == 0 {
+                    parent
+                } else {
+                    let delimiter = self.net.add(Kind::Delim {
+                        level: 0,
+                        count: crossed,
+                    });
+                    self.net.link(delimiter.port(slot::INSIDE), parent);
+                    delimiter.principal()
+                };
                 self.occurrences[binder].push(port);
             }
             Term::Free(name) => {
@@ -150,10 +155,19 @@ mod tests {
     }
 
     #[test]
-    fn crossing_a_binder_costs_a_delimiter() {
+    fn crossing_binders_costs_a_delimiter() {
         // `x` leaves the scope of `y`, and of `y` and `z`.
         assert_eq!(census(&net_of(r"\x. \y. x")), [2, 0, 0, 1, 1]);
-        assert_eq!(census(&net_of(r"\x. \y. \z. x")), [3, 0, 0, 2, 2]);
+        let net = net_of(r"\x. \y. \z. x");
+        assert_eq!(census(&net), [3, 0, 0, 1, 2]);
+        let heights: Vec<u32> = net
+            .nodes()
+            .filter_map(|(_, kind)| match kind {
+                Kind::Delim { count, .. } => Some(count),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(heights, [2]);
     }
 
     #[test]

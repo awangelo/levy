@@ -22,6 +22,8 @@ pub struct NodeView {
     pub label: String,
     /// The level of a fan or of a delimiter.
     pub level: Option<u32>,
+    /// How many delimiters of that level the node stands for.
+    pub height: Option<u32>,
     pub column: f32,
     pub row: u32,
 }
@@ -200,20 +202,21 @@ impl Stepper {
 }
 
 fn node_view(net: &Net, node: NodeId, column: f32, row: u32) -> NodeView {
-    let (kind, label, level) = match net.kind(node) {
-        Kind::Root => ("root", "", None),
-        Kind::Lam { name } => ("lam", net.name(name), None),
-        Kind::App => ("app", "", None),
-        Kind::Fan { level } => ("fan", "", Some(level)),
-        Kind::Delim { level } => ("delim", "", Some(level)),
-        Kind::Eraser => ("eraser", "", None),
-        Kind::Free { name } => ("free", net.name(name), None),
+    let (kind, label, level, height) = match net.kind(node) {
+        Kind::Root => ("root", "", None, None),
+        Kind::Lam { name } => ("lam", net.name(name), None, None),
+        Kind::App => ("app", "", None, None),
+        Kind::Fan { level } => ("fan", "", Some(level), None),
+        Kind::Delim { level, count } => ("delim", "", Some(level), Some(count)),
+        Kind::Eraser => ("eraser", "", None, None),
+        Kind::Free { name } => ("free", net.name(name), None, None),
     };
     NodeView {
         id: net.serial(node),
         kind,
         label: label.to_owned(),
         level,
+        height,
         column,
         row,
     }

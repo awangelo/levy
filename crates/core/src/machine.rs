@@ -11,6 +11,9 @@
 //! is contracted once. Together that makes the number of beta interactions
 //! optimal in Lévy's sense.
 //!
+//! Delimiters that pile up on the way are merged into one node as the walk
+//! passes them, which is what keeps the bookkeeping within bounds.
+//!
 //! The same walk, with rewriting turned off, reads the net back as a term at
 //! any point of the reduction.
 
@@ -182,6 +185,13 @@ trait Policy {
     /// Rewrites the pair if it interacts and this policy reduces. Reports
     /// whether the net changed.
     fn fire(&mut self, upper: NodeId, lower: NodeId) -> Result<bool, Halt>;
+
+    /// Merges into the delimiter at `exit` the one stacked on it, if there is
+    /// one and this policy reduces. Returns the level and the height of what
+    /// was merged in.
+    fn merge(&mut self, _exit: Port) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 /// Leaves the net alone.
@@ -249,6 +259,10 @@ impl Policy for Reduce<'_> {
         }
         Ok(true)
     }
+
+    fn merge(&mut self, exit: Port) -> Option<(u32, u32)> {
+        rules::merge(&mut self.machine.net, exit)
+    }
 }
 
 fn walk(policy: &mut impl Policy) -> Result<Term, Halt> {
@@ -303,6 +317,16 @@ impl<P: Policy> Walker<'_, P> {
                 }
                 continue;
             }
+            if let Some((level, height)) = self.policy.merge(top.exit) {
+                // The delimiter of the top frame took in the one stacked on
+                // it, and the walk has now passed that one's scopes as well.
+                top.context = if top.exit.is_principal() {
+                    top.context.leave_scopes(level, height)
+                } else {
+                    top.context.enter_scopes(level, height)
+                };
+                continue;
+            }
             let node = entry.node;
             let context = &top.context;
             let next = match (self.policy.net().kind(node), entry.slot) {
@@ -326,13 +350,13 @@ impl<P: Policy> Walker<'_, P> {
                     exit: node.principal(),
                     context: context.take_branch(level, branch),
                 },
-                (Kind::Delim { level }, slot::PRINCIPAL) => Frame {
+                (Kind::Delim { level, count }, slot::PRINCIPAL) => Frame {
                     exit: node.port(slot::INSIDE),
-                    context: context.enter_scope(level),
+                    context: context.enter_scopes(level, count),
                 },
-                (Kind::Delim { level }, _) => Frame {
+                (Kind::Delim { level, count }, _) => Frame {
                     exit: node.principal(),
-                    context: context.leave_scope(level),
+                    context: context.leave_scopes(level, count),
                 },
                 (Kind::Lam { .. }, _) => {
                     return Err(Halt::Malformed("an abstraction is entered from its body"));

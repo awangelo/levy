@@ -8,7 +8,7 @@ page that steps through the reduction one graph rewrite at a time.
 ```
 λ> :compare 2 2 2 2 id id
 λx. x
-optimal:      27 β-steps, 1553 bookkeeping steps
+optimal:      27 β-steps, 1151 bookkeeping steps
 normal order: 258294 β-steps in 27 families
 ```
 
@@ -70,7 +70,8 @@ net.
    each other. *Beta* removes an application and its abstraction and leaves
    two delimiters around the former body. Fans and delimiters of equal level
    *annihilate*; any other pair *commutes*, each node copying the other, with
-   levels adjusted like de Bruijn indices.
+   levels adjusted like de Bruijn indices. One delimiter node stands for a
+   whole stack of delimiters of the same level, so that they move together.
 3. **Strategy** (`machine.rs`). The machine walks the net as one reads a term,
    head first, and rewrites only the active pairs on its way. That is
    leftmost-outermost order, so redexes nothing needs are never touched, and a
@@ -99,10 +100,15 @@ cargo test --release
 ## Limitations
 
 - **Optimal in β-steps, not in time.** The bookkeeping that keeps sharing
-  correct dominates: `fib 20` takes 283 β-steps and 1.5 million bookkeeping
-  interactions. The known remedies (merging delimiters, safe fans) are not
-  implemented. On ordinary programs a conventional lazy evaluator is much
-  faster; this one wins only when sharing under binders matters.
+  correct dominates: `fib 20` takes 283 β-steps and 635,474 bookkeeping
+  interactions. Stacked delimiters are merged, which cuts that work by a
+  factor of two to three, but the other known remedies (safe fans, garbage
+  collection of fans with a dead branch) are not implemented. On ordinary
+  programs a conventional lazy evaluator is much faster; this one wins only
+  when sharing under binders matters.
+- **Normal forms stay shared.** The net of a normal form can hold fans and
+  delimiters that nothing will ever move. Reading it back gives the plain
+  term, but the picture of it is larger than the term.
 - **Deep terms need a deep stack.** Terms are trees handled by recursion, and
   a Church numeral nests as deep as its value. The REPL runs on a 1 GiB stack
   for that reason; library users must do the same for deep terms.

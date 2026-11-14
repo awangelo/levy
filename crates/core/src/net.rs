@@ -73,7 +73,10 @@ pub enum Kind {
     /// Ports: shared side, first branch, second branch.
     Fan { level: u32 },
     /// A delimiter, which marks the border of a scope. Ports: outside, inside.
-    Delim { level: u32 },
+    ///
+    /// One node stands for `count` delimiters of the same level stacked on
+    /// each other, that is, for the borders of that many nested scopes.
+    Delim { level: u32, count: u32 },
     /// A plug for a port nothing uses. Ports: the unused side.
     Eraser,
     /// A free variable. Ports: parent.
@@ -218,6 +221,15 @@ impl Net {
         self.node(id).kind
     }
 
+    /// Changes what a node is. The new kind must have as many ports.
+    pub fn set_kind(&mut self, id: NodeId, kind: Kind) {
+        let node = self.cells[id.index()]
+            .as_mut()
+            .unwrap_or_else(|| panic!("node {id:?} is not in the net"));
+        assert_eq!(node.kind.ports(), kind.ports(), "a node keeps its ports");
+        node.kind = kind;
+    }
+
     /// A number that tells this node apart from every node the net has ever
     /// held. Identifiers are reused once a node is removed; serials are not.
     pub fn serial(&self, id: NodeId) -> u64 {
@@ -338,7 +350,7 @@ mod tests {
     #[test]
     fn splice_joins_wires_and_drops_closed_loops() {
         let mut net = Net::new();
-        let delim = net.add(Kind::Delim { level: 0 });
+        let delim = net.add(Kind::Delim { level: 0, count: 1 });
         let free = {
             let name = net.intern("y");
             net.add(Kind::Free { name })
@@ -388,7 +400,7 @@ mod tests {
         assert_eq!(Kind::Fan { level: 0 }.exits(slot::PRINCIPAL), [1, 2]);
         assert_eq!(Kind::Fan { level: 0 }.exits(2), [slot::PRINCIPAL]);
         assert_eq!(
-            Kind::Delim { level: 0 }.exits(slot::INSIDE),
+            Kind::Delim { level: 0, count: 1 }.exits(slot::INSIDE),
             [slot::PRINCIPAL]
         );
         assert!(Kind::Eraser.exits(slot::PRINCIPAL).is_empty());

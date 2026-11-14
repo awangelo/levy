@@ -16,7 +16,8 @@ pub fn to_dot(net: &Net) -> String {
             Kind::Lam { name } => format!("λ{}", net.name(name)),
             Kind::App => "@".to_owned(),
             Kind::Fan { level } => format!("▽{level}"),
-            Kind::Delim { level } => format!("⌒{level}"),
+            Kind::Delim { level, count: 1 } => format!("⌒{level}"),
+            Kind::Delim { level, count } => format!("⌒{level}×{count}"),
             Kind::Eraser => "⊗".to_owned(),
             Kind::Free { name } => net.name(name).to_owned(),
         };

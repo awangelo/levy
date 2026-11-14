@@ -93,7 +93,9 @@ function describe(node) {
     case "fan":
       return `fan, level ${node.level}`;
     case "delim":
-      return `delimiter, level ${node.level}`;
+      return node.height > 1
+        ? `${node.height} stacked delimiters, level ${node.level}`
+        : `delimiter, level ${node.level}`;
     case "eraser":
       return "eraser: nothing uses this port";
     case "free":
@@ -147,6 +149,7 @@ function buildNode(node, isNext) {
       svg("circle", { class: "shape", r: RADIUS.root }, group);
   }
   if (text) svg("text", {}, group).textContent = text;
+  if (node.height > 1) svg("text", { class: "height", x: 16, y: 9 }, group).textContent = `×${node.height}`;
   return { id: node.id, kind: node.kind, group, turning, faces: null };
 }
 
