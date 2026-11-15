@@ -105,6 +105,10 @@ net.
 4. **Readback** (`context.rs`, `machine.rs`). The same walk without rewriting
    turns a net back into a term at any point. It carries a context that
    records which fan branch it came through and which scopes it has left.
+   The walk only goes back to earlier contexts in the reverse of the order it
+   reached them, so there is one context, changed in place, with a log of
+   how to undo each change. A step costs about the same however deeply the
+   scopes nest.
 5. **Garbage collection** (`gc.rs`). Whatever a reading from the root cannot
    reach is removed.
 
@@ -142,11 +146,6 @@ others.
   known remedies (safe fans, garbage collection of fans with a dead branch)
   are not implemented. On ordinary programs a conventional lazy evaluator is
   much faster; this one wins only when sharing under binders matters.
-- **A step of the walk costs more the deeper the scopes nest.** The context
-  the walk carries is a list with one entry per scope, and a fan or a
-  delimiter of level `n` rebuilds `n` entries of it. `fact 8` takes 26 s for
-  467,225 bookkeeping interactions where `fib 20` takes half a second for
-  more. A context with cheap access in the middle would fix that.
 - **Normal forms stay shared.** The net of a normal form can hold fans and
   delimiters that nothing will ever move. Reading it back gives the plain
   term, but the picture of it is larger than the term.

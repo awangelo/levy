@@ -196,6 +196,9 @@ impl Net {
         self.cells.len() - self.vacant.len()
     }
 
+    /// The bytes one place for a node takes.
+    pub const SLOT_BYTES: usize = size_of::<Option<Node>>();
+
     /// The number of places for nodes the net holds, in use or not: what a
     /// copy of the net costs.
     pub fn slots(&self) -> usize {

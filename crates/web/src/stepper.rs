@@ -19,8 +19,9 @@ const READ_FUEL: u64 = 10_000;
 const TOO_LARGE: &str = "<a term too large to show>";
 /// How many operations lie between two of the states kept for stepping back.
 const OPERATIONS_PER_SNAPSHOT: usize = 32;
-/// How many places for nodes the kept states may hold between them. At some
-/// 60 bytes a place this is around 100 MB.
+/// How many places for nodes the kept states may hold between them, the
+/// contexts of their walks counted in the same unit. At some 60 bytes a
+/// place this is around 100 MB.
 const SNAPSHOT_SLOTS: usize = 2_000_000;
 /// How many interactions before the state gone back to another state is
 /// kept, if none is nearer, so that going further back stays cheap.
@@ -123,7 +124,8 @@ pub struct Stepper {
     /// The operations that lead from the last snapshot to the current state,
     /// each as the number of interactions it fired.
     since: Vec<u64>,
-    /// How many places for nodes the snapshots may hold between them.
+    /// How many places for nodes the snapshots may hold between them, as
+    /// [`Machine::slots`] counts them.
     snapshot_slots: usize,
 }
 
@@ -197,14 +199,10 @@ impl Stepper {
     fn keep(&mut self, state: Machine, stretch: Vec<u64>) {
         self.snapshots.push_back(state);
         self.stretches.push_back(stretch);
-        let mut slots: usize = self
-            .snapshots
-            .iter()
-            .map(|machine| machine.net().slots())
-            .sum();
+        let mut slots: usize = self.snapshots.iter().map(|machine| machine.slots()).sum();
         while slots > self.snapshot_slots && self.snapshots.len() > 1 {
             if let Some(oldest) = self.snapshots.pop_front() {
-                slots -= oldest.net().slots();
+                slots -= oldest.slots();
             }
             self.stretches.pop_front();
         }
@@ -554,7 +552,7 @@ fact  = fix (\\self n. iszero n 1 (times n (self (pred n))))
         let slots: usize = stepper
             .snapshots
             .iter()
-            .map(|machine| machine.net().slots())
+            .map(|machine| machine.slots())
             .sum();
         assert!(slots <= 300, "{slots}");
         // What is left of the past can still be gone back through, down to

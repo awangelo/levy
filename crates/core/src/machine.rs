@@ -19,7 +19,7 @@
 
 use std::fmt;
 
-use crate::context::Context;
+use crate::context::{Context, Mark};
 use crate::gc;
 use crate::net::{Kind, Net, NodeId, Port, Symbol, slot};
 use crate::rules::{self, Rule};
@@ -102,9 +102,6 @@ const GROWTH_BEFORE_COLLECTION: usize = 4;
 const SMALLEST_COLLECTION: usize = 4_096;
 
 /// A net under reduction.
-///
-/// A machine stays on the thread it was made on: the walk it keeps between
-/// calls counts its references without locking, which is a sixth faster.
 #[derive(Clone, Debug)]
 pub struct Machine {
     net: Net,
@@ -136,6 +133,16 @@ impl Machine {
             collect_at: SMALLEST_COLLECTION,
             progress: Progress::Idle,
         })
+    }
+
+    /// What a copy of the machine costs, in places for nodes: those of the
+    /// net, and the context of a walk under way counted in the same unit.
+    pub fn slots(&self) -> usize {
+        let walk = match &self.progress {
+            Progress::Suspended(state) => state.context.bytes().div_ceil(Net::SLOT_BYTES),
+            Progress::Idle | Progress::Normal => 0,
+        };
+        self.net.slots() + walk
     }
 
     /// The net as it stands.
@@ -253,7 +260,7 @@ impl Machine {
         // A walk that stopped for want of allowance stands in front of the
         // very pair it would have rewritten next.
         if let Progress::Suspended(Suspended { top, .. }) = &self.progress {
-            let (upper, lower) = (top.exit, self.net.peer(top.exit));
+            let (upper, lower) = (*top, self.net.peer(*top));
             if upper.is_principal()
                 && lower.is_principal()
                 && let Some(rule) =
@@ -418,12 +425,12 @@ fn read(policy: &mut impl Policy, fuel: u64) -> Result<Term, Halt> {
     walker.term()
 }
 
-/// A point on the way down: the port the walk leaves a node by, and the
-/// context it carries from there.
-#[derive(Clone, Debug)]
+/// A point passed on the way down: the port the walk left a node by, and the
+/// mark of the context it carried from there.
+#[derive(Clone, Copy, Debug)]
 struct Frame {
     exit: Port,
-    context: Context,
+    mark: Mark,
 }
 
 /// What the walk finds at the head of a term.
@@ -436,9 +443,9 @@ enum Head {
 /// What is left to do once the term being read is complete.
 #[derive(Clone, Debug)]
 enum Pending {
-    /// Read the argument of this application, in this context, and apply the
-    /// term to it.
-    Argument(NodeId, Context),
+    /// Read the argument of this application, in the context of this mark,
+    /// and apply the term to it.
+    Argument(NodeId, Mark),
     /// The term is the body of an abstraction of this name: close it.
     Body(String),
     /// The term is an argument: apply this function to it.
@@ -453,10 +460,14 @@ struct Suspended {
     /// The frames passed on the way to the head being looked for, the
     /// starting one first.
     passed: Vec<Frame>,
-    /// The frame the walk goes on from.
-    top: Frame,
+    /// The port the walk goes on from.
+    top: Port,
+    /// The context it carries from there.
+    context: Context,
     /// What waits for the term being read, the innermost last.
     pending: Vec<Pending>,
+    /// How many of `pending` are arguments, which need their marks kept.
+    arguments: usize,
 }
 
 impl Suspended {
@@ -465,11 +476,10 @@ impl Suspended {
         Suspended {
             binders: Vec::new(),
             passed: Vec::new(),
-            top: Frame {
-                exit: net.root().principal(),
-                context: Context::default(),
-            },
+            top: net.root().principal(),
+            context: Context::default(),
             pending: Vec::new(),
+            arguments: 0,
         }
     }
 }
@@ -496,16 +506,14 @@ impl<P: Policy> Walker<'_, P> {
     /// the state in front of the node it stopped at.
     fn term(&mut self) -> Result<Term, Halt> {
         loop {
-            let (head, context) = self.head()?;
+            let head = self.head()?;
             let state = &mut self.state;
             let mut term = match head {
                 Head::Lam(node, name) => {
                     let name = self.policy.net().name(name).to_owned();
                     state.pending.push(Pending::Body(name));
-                    state.top = Frame {
-                        exit: node.port(slot::BODY),
-                        context: context.enter_abstraction(state.binders.len()),
-                    };
+                    state.top = node.port(slot::BODY);
+                    state.context.enter_abstraction(state.binders.len());
                     state.binders.push(node);
                     continue;
                 }
@@ -513,7 +521,8 @@ impl<P: Policy> Walker<'_, P> {
                     // A shared abstraction can occur inside a copy of itself,
                     // so the node alone does not say which copy binds the
                     // variable. The scope the walk is in does.
-                    let binder = context
+                    let binder = state
+                        .context
                         .binder()
                         .filter(|&binder| state.binders.get(binder) == Some(&node))
                         .ok_or(Halt::Malformed("a variable occurs outside its binder"))?;
@@ -526,12 +535,15 @@ impl<P: Policy> Walker<'_, P> {
             loop {
                 match state.pending.pop() {
                     None => return Ok(term),
-                    Some(Pending::Argument(app, context)) => {
+                    Some(Pending::Argument(app, mark)) => {
+                        state.context.restore(mark);
+                        state.arguments -= 1;
+                        if state.arguments == 0 {
+                            // No earlier context will be needed again.
+                            state.context.forget();
+                        }
                         state.pending.push(Pending::Function(term));
-                        state.top = Frame {
-                            exit: app.port(slot::ARG),
-                            context,
-                        };
+                        state.top = app.port(slot::ARG);
                         break;
                     }
                     Some(Pending::Body(name)) => {
@@ -545,68 +557,64 @@ impl<P: Policy> Walker<'_, P> {
     }
 
     /// Goes down from the top frame to the head of the term there, rewriting
-    /// the active pairs on the way if the policy does. Returns the head and
-    /// the context it is reached in, and adds the applications passed to
-    /// what is pending, the outermost first.
-    fn head(&mut self) -> Result<(Head, Context), Halt> {
+    /// the active pairs on the way if the policy does. Returns the head,
+    /// leaves the context as it is there, and adds the applications passed
+    /// to what is pending, the outermost first.
+    fn head(&mut self) -> Result<Head, Halt> {
         let head = loop {
             self.spend()?;
             let state = &mut self.state;
-            let top = &mut state.top;
-            let entry = self.policy.net().peer(top.exit);
-            if top.exit.is_principal()
+            let top = state.top;
+            let entry = self.policy.net().peer(top);
+            if top.is_principal()
                 && entry.is_principal()
-                && self.policy.fire(top.exit.node, entry.node)?
+                && self.policy.fire(top.node, entry.node)?
             {
                 // The node of the top frame is gone. Whatever replaced it
                 // hangs from the frame before, so resume there. The starting
                 // frame is only ever the root, which survives.
                 if let Some(previous) = state.passed.pop() {
-                    *top = previous;
+                    state.top = previous.exit;
+                    state.context.restore(previous.mark);
                 }
                 continue;
             }
-            if let Some((level, height)) = self.policy.merge(top.exit) {
+            if let Some((level, height)) = self.policy.merge(top) {
                 // The delimiter of the top frame took in the one stacked on
                 // it, and the walk has now passed that one's scopes as well.
-                top.context = if top.exit.is_principal() {
-                    top.context.leave_scopes(level, height)
+                if top.is_principal() {
+                    state.context.leave_scopes(level, height);
                 } else {
-                    top.context.enter_scopes(level, height)
-                };
+                    state.context.enter_scopes(level, height);
+                }
                 continue;
             }
             let node = entry.node;
-            let context = &top.context;
+            let mark = state.context.mark();
+            let context = &mut state.context;
             let next = match (self.policy.net().kind(node), entry.slot) {
                 (Kind::Lam { name }, slot::PRINCIPAL) => break Head::Lam(node, name),
                 (Kind::Lam { .. }, slot::VAR) => break Head::Bound(node),
                 (Kind::Free { name }, _) => break Head::Free(name),
-                (Kind::App, slot::RESULT) => Frame {
-                    exit: node.principal(),
-                    context: context.clone(),
-                },
+                (Kind::App, slot::RESULT) => node.principal(),
                 (Kind::Fan { level }, slot::PRINCIPAL) => {
-                    let (branch, context) = context
+                    let branch = context
                         .recall_branch(level)
                         .ok_or(Halt::Malformed("a fan is entered with no branch on record"))?;
-                    Frame {
-                        exit: node.port(branch),
-                        context,
-                    }
+                    node.port(branch)
                 }
-                (Kind::Fan { level }, branch) => Frame {
-                    exit: node.principal(),
-                    context: context.take_branch(level, branch),
-                },
-                (Kind::Delim { level, count }, slot::PRINCIPAL) => Frame {
-                    exit: node.port(slot::INSIDE),
-                    context: context.enter_scopes(level, count),
-                },
-                (Kind::Delim { level, count }, _) => Frame {
-                    exit: node.principal(),
-                    context: context.leave_scopes(level, count),
-                },
+                (Kind::Fan { level }, branch) => {
+                    context.take_branch(level, branch);
+                    node.principal()
+                }
+                (Kind::Delim { level, count }, slot::PRINCIPAL) => {
+                    context.enter_scopes(level, count);
+                    node.port(slot::INSIDE)
+                }
+                (Kind::Delim { level, count }, _) => {
+                    context.leave_scopes(level, count);
+                    node.principal()
+                }
                 (Kind::Lam { .. }, _) => {
                     return Err(Halt::Malformed("an abstraction is entered from its body"));
                 }
@@ -616,22 +624,29 @@ impl<P: Policy> Walker<'_, P> {
                 (Kind::Eraser, _) => return Err(Halt::Malformed("the walk ran into an eraser")),
                 (Kind::Root, _) => return Err(Halt::Malformed("the walk came back to the root")),
             };
-            state.passed.push(std::mem::replace(top, next));
+            state.passed.push(Frame { exit: top, mark });
+            state.top = next;
         };
         // Nothing on this stretch will be rewritten any more, so only the
         // applications are still of interest: each takes an argument once
-        // the head is done. Letting go of the fans and delimiters here is
-        // what keeps the memory of a walk in proportion to the term it has
-        // read, not to the length of the path it took.
+        // the head is done.
         let state = &mut self.state;
         let net = self.policy.net();
-        let frames = state.passed.drain(..).chain([state.top.clone()]);
-        for Frame { exit, context } in frames {
+        let top = Frame {
+            exit: state.top,
+            mark: state.context.mark(),
+        };
+        for Frame { exit, mark } in state.passed.drain(..).chain([top]) {
             if exit.is_principal() && net.kind(exit.node) == Kind::App {
-                state.pending.push(Pending::Argument(exit.node, context));
+                state.pending.push(Pending::Argument(exit.node, mark));
+                state.arguments += 1;
             }
         }
-        Ok((head, state.top.context.clone()))
+        if state.arguments == 0 {
+            // No earlier context will be needed again.
+            state.context.forget();
+        }
+        Ok(head)
     }
 
     /// Pays for one node the walk comes to.

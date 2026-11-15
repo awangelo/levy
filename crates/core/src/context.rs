@@ -15,182 +15,287 @@
 //!
 //! Every rule except beta leaves these readings unchanged, which is what
 //! makes reading back independent of how far the net has been reduced.
+//!
+//! The walk goes back to earlier contexts only in the reverse of the order it
+//! reached them, as a depth-first search does. So a context is changed in
+//! place, and every change leaves a note on a trail of how to take it back: a
+//! mark is a length of the trail, and restoring it takes back the changes
+//! made since. Each change costs the same however deep its level, except
+//! that closing or opening a scope moves the indices of the scopes inside it.
 
-use std::rc::Rc;
-
-/// A persistent stack: pushing and popping return new stacks that share
-/// structure with the old one.
-#[derive(Debug)]
-struct Stack<T>(Option<Rc<Link<T>>>);
-
-#[derive(Debug)]
-struct Link<T> {
-    head: T,
-    tail: Stack<T>,
-}
-
-impl<T> Clone for Stack<T> {
-    fn clone(&self) -> Self {
-        Stack(self.0.clone())
-    }
-}
-
-impl<T> Default for Stack<T> {
-    fn default() -> Self {
-        Stack(None)
-    }
-}
-
-impl<T> Drop for Stack<T> {
-    /// Unlinks iteratively, so that dropping a long stack cannot overflow the
-    /// call stack.
-    fn drop(&mut self) {
-        let mut next = self.0.take();
-        while let Some(link) = next {
-            next = Rc::into_inner(link).and_then(|mut link| link.tail.0.take());
-        }
-    }
-}
-
-impl<T: Clone> Stack<T> {
-    fn push(&self, head: T) -> Stack<T> {
-        Stack(Some(Rc::new(Link {
-            head,
-            tail: self.clone(),
-        })))
-    }
-
-    fn pop(&self) -> Option<(T, Stack<T>)> {
-        self.0
-            .as_ref()
-            .map(|link| (link.head.clone(), link.tail.clone()))
-    }
-
-    fn top(&self) -> Option<&T> {
-        self.0.as_ref().map(|link| &link.head)
-    }
-}
+/// Stands for no scope, no binder, or the end of a stack.
+const NONE: u32 = u32::MAX;
 
 /// What the walk remembers about one scope.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct Scope {
     /// The abstraction whose body this scope is, as the number of
     /// abstractions around it in the term being read. Scopes opened by
     /// delimiters have none.
-    binder: Option<usize>,
-    /// Fan branches taken at this level, most recent first.
-    branches: Stack<u8>,
+    binder: u32,
+    /// Fan branches taken at this level, most recent on top.
+    branches: u32,
     /// Scopes directly inside this one that the walk has left, most recent
-    /// first.
-    suspended: Stack<Scope>,
+    /// on top.
+    suspended: u32,
 }
+
+impl Default for Scope {
+    fn default() -> Self {
+        Scope {
+            binder: NONE,
+            branches: NONE,
+            suspended: NONE,
+        }
+    }
+}
+
+/// One entry of a stack: a value and the cell below it.
+#[derive(Clone, Copy, Debug)]
+struct Cell {
+    value: u32,
+    below: u32,
+}
+
+/// Many stacks of numbers in one arena, each named by its top cell. Cells
+/// popped off are reused, so that what the walk lets go of is not kept.
+#[derive(Clone, Debug)]
+struct Stacks {
+    cells: Vec<Cell>,
+    /// The first unused cell, and through `below` the others.
+    free: u32,
+}
+
+impl Default for Stacks {
+    fn default() -> Self {
+        Stacks {
+            cells: Vec::new(),
+            free: NONE,
+        }
+    }
+}
+
+impl Stacks {
+    fn push(&mut self, top: &mut u32, value: u32) {
+        let cell = Cell { value, below: *top };
+        *top = if self.free == NONE {
+            self.cells.push(cell);
+            index(self.cells.len() - 1)
+        } else {
+            let free = self.free;
+            self.free = self.cells[free as usize].below;
+            self.cells[free as usize] = cell;
+            free
+        };
+    }
+
+    fn pop(&mut self, top: &mut u32) -> Option<u32> {
+        let cell = *self.cells.get(*top as usize)?;
+        self.cells[*top as usize].below = self.free;
+        self.free = *top;
+        *top = cell.below;
+        Some(cell.value)
+    }
+}
+
+/// How to take back one change. Positions are indices into `Context::open`
+/// as it stood right after the change.
+#[derive(Clone, Copy, Debug)]
+enum Undo {
+    /// This many implicit scopes were made explicit at the outer end.
+    Reach(u32),
+    /// An abstraction opened a new innermost scope.
+    Abstraction,
+    /// A branch was recorded in the scope at this position.
+    Take(u32),
+    /// This branch was recalled from the scope at this position.
+    Recall(u32, u8),
+    /// The scope that was at this position was closed and suspended in the
+    /// one before it.
+    Leave(u32),
+    /// A scope was opened right after this position: the one suspended last
+    /// in the scope there if `true`, a fresh one if `false`.
+    Enter(u32, bool),
+}
+
+/// A point to come back to, as returned by [`Context::mark`].
+pub type Mark = usize;
 
 /// The memory of a walk. Scopes that were never touched are implicit.
 #[derive(Clone, Debug, Default)]
 pub struct Context {
-    /// Innermost scope first.
-    scopes: Stack<Scope>,
+    /// The open scopes, outermost first, as indices into `scopes`: level `n`
+    /// is `n` places from the end.
+    open: Vec<u32>,
+    /// Every scope, open or suspended. Scopes are made and unmade last in,
+    /// first out, so this is a stack.
+    scopes: Vec<Scope>,
+    /// The branches and suspended scopes of all of them.
+    stacks: Stacks,
+    /// The changes that may still be taken back, oldest first.
+    trail: Vec<Undo>,
+    /// How many changes came before the first one on the trail.
+    forgotten: usize,
+}
+
+fn index(value: usize) -> u32 {
+    u32::try_from(value).expect("fewer than 2^32 scopes")
 }
 
 impl Context {
-    /// Separates the `count` innermost scopes from the rest.
-    fn split(&self, count: u32) -> (Vec<Scope>, Stack<Scope>) {
-        let mut inner = Vec::new();
-        let mut rest = self.scopes.clone();
-        for _ in 0..count {
-            let (scope, outer) = rest.pop().unwrap_or_default();
-            inner.push(scope);
-            rest = outer;
-        }
-        (inner, rest)
+    /// The point the context has reached, to [`restore`](Context::restore)
+    /// later.
+    pub fn mark(&self) -> Mark {
+        self.forgotten + self.trail.len()
     }
 
-    fn join(inner: Vec<Scope>, rest: Stack<Scope>) -> Context {
-        let scopes = inner
-            .into_iter()
-            .rev()
-            .fold(rest, |scopes, scope| scopes.push(scope));
-        Context { scopes }
+    /// Takes back every change made since `mark`.
+    pub fn restore(&mut self, mark: Mark) {
+        let keep = mark
+            .checked_sub(self.forgotten)
+            .expect("the mark was not forgotten");
+        while self.trail.len() > keep {
+            let Some(undo) = self.trail.pop() else { break };
+            self.undo(undo);
+        }
+    }
+
+    /// The bytes a copy of the context takes.
+    pub fn bytes(&self) -> usize {
+        self.open.len() * size_of::<u32>()
+            + self.scopes.len() * size_of::<Scope>()
+            + self.stacks.cells.len() * size_of::<Cell>()
+            + self.trail.len() * size_of::<Undo>()
+    }
+
+    /// Gives up the means to restore any mark taken so far.
+    pub fn forget(&mut self) {
+        self.forgotten += self.trail.len();
+        self.trail.clear();
+    }
+
+    fn undo(&mut self, undo: Undo) {
+        match undo {
+            Undo::Reach(count) => {
+                let count = count as usize;
+                self.open.drain(..count);
+                self.scopes.truncate(self.scopes.len() - count);
+            }
+            Undo::Abstraction => {
+                self.open.pop();
+                self.scopes.pop();
+            }
+            Undo::Take(at) => {
+                let scope = self.open[at as usize] as usize;
+                self.stacks.pop(&mut self.scopes[scope].branches);
+            }
+            Undo::Recall(at, branch) => {
+                let scope = self.open[at as usize] as usize;
+                self.stacks
+                    .push(&mut self.scopes[scope].branches, u32::from(branch));
+            }
+            Undo::Leave(at) => {
+                let at = at as usize;
+                let around = self.open[at - 1] as usize;
+                let scope = self
+                    .stacks
+                    .pop(&mut self.scopes[around].suspended)
+                    .expect("the left scope is suspended");
+                self.open.insert(at, scope);
+            }
+            Undo::Enter(at, resumed) => {
+                let at = at as usize;
+                let scope = self.open.remove(at + 1);
+                if resumed {
+                    let around = self.open[at] as usize;
+                    self.stacks.push(&mut self.scopes[around].suspended, scope);
+                } else {
+                    self.scopes.pop();
+                }
+            }
+        }
+    }
+
+    /// Makes the scopes up to `level + above` explicit, and returns the
+    /// position of the one at `level`.
+    fn reach(&mut self, level: u32, above: u32) -> usize {
+        let needed = level as usize + above as usize + 1;
+        if self.open.len() < needed {
+            let count = needed - self.open.len();
+            let first = index(self.scopes.len());
+            self.scopes
+                .resize_with(self.scopes.len() + count, Scope::default);
+            self.open.splice(..0, first..first + index(count));
+            self.trail.push(Undo::Reach(index(count)));
+        }
+        self.open.len() - 1 - level as usize
     }
 
     /// Opens a fresh innermost scope for the body of an abstraction that has
     /// `binder` abstractions around it.
-    pub fn enter_abstraction(&self, binder: usize) -> Context {
-        let scope = Scope {
-            binder: Some(binder),
+    pub fn enter_abstraction(&mut self, binder: usize) {
+        self.open.push(index(self.scopes.len()));
+        self.scopes.push(Scope {
+            binder: index(binder),
             ..Scope::default()
-        };
-        Context {
-            scopes: self.scopes.push(scope),
-        }
+        });
+        self.trail.push(Undo::Abstraction);
     }
 
     /// The abstraction whose body is the innermost scope, if that scope was
     /// opened by one.
     pub fn binder(&self) -> Option<usize> {
-        self.scopes.top().and_then(|scope| scope.binder)
+        let scope = *self.open.last()? as usize;
+        let binder = self.scopes[scope].binder;
+        (binder != NONE).then_some(binder as usize)
     }
 
     /// Records the branch by which the walk came into a fan of this level.
-    pub fn take_branch(&self, level: u32, branch: u8) -> Context {
-        let (inner, rest) = self.split(level);
-        let (mut scope, rest) = rest.pop().unwrap_or_default();
-        scope.branches = scope.branches.push(branch);
-        Context::join(inner, rest.push(scope))
+    pub fn take_branch(&mut self, level: u32, branch: u8) {
+        let at = self.reach(level, 0);
+        let scope = self.open[at] as usize;
+        self.stacks
+            .push(&mut self.scopes[scope].branches, u32::from(branch));
+        self.trail.push(Undo::Take(index(at)));
     }
 
     /// Recalls the branch recorded last at this level, if there is one.
-    pub fn recall_branch(&self, level: u32) -> Option<(u8, Context)> {
-        let (inner, rest) = self.split(level);
-        let (mut scope, rest) = rest.pop().unwrap_or_default();
-        let (branch, branches) = scope.branches.pop()?;
-        scope.branches = branches;
-        Some((branch, Context::join(inner, rest.push(scope))))
-    }
-
-    /// Closes the scope at this level and suspends it in the one around.
-    #[cfg(test)]
-    fn leave_scope(&self, level: u32) -> Context {
-        self.leave_scopes(level, 1)
+    pub fn recall_branch(&mut self, level: u32) -> Option<u8> {
+        let at = self.open.len().checked_sub(level as usize + 1)?;
+        let scope = self.open[at] as usize;
+        let branch = self.stacks.pop(&mut self.scopes[scope].branches)? as u8;
+        self.trail.push(Undo::Recall(index(at), branch));
+        Some(branch)
     }
 
     /// Closes `count` scopes in a row at this level, as a stack of that many
     /// delimiters does.
-    ///
-    /// The scopes inside the level are set aside once for the whole stack,
-    /// so the cost is the level plus the count, not their product.
-    pub fn leave_scopes(&self, level: u32, count: u32) -> Context {
-        let (inner, mut rest) = self.split(level);
+    pub fn leave_scopes(&mut self, level: u32, count: u32) {
         for _ in 0..count {
-            let (scope, outer) = rest.pop().unwrap_or_default();
-            let (mut around, outer) = outer.pop().unwrap_or_default();
-            around.suspended = around.suspended.push(scope);
-            rest = outer.push(around);
+            let at = self.reach(level, 1);
+            let scope = self.open.remove(at);
+            let around = self.open[at - 1] as usize;
+            self.stacks.push(&mut self.scopes[around].suspended, scope);
+            self.trail.push(Undo::Leave(index(at)));
         }
-        Context::join(inner, rest)
     }
 
-    /// Reopens at this level the scope suspended last, or a fresh one.
-    #[cfg(test)]
-    fn enter_scope(&self, level: u32) -> Context {
-        self.enter_scopes(level, 1)
-    }
-
-    /// Reopens `count` scopes in a row at this level.
-    pub fn enter_scopes(&self, level: u32, count: u32) -> Context {
-        let (inner, mut rest) = self.split(level);
+    /// Reopens `count` scopes in a row at this level, each the one suspended
+    /// last there, or a fresh one.
+    pub fn enter_scopes(&mut self, level: u32, count: u32) {
         for _ in 0..count {
-            let (mut around, outer) = rest.pop().unwrap_or_default();
-            let scope = match around.suspended.pop() {
-                Some((scope, suspended)) => {
-                    around.suspended = suspended;
-                    scope
+            let at = self.reach(level, 0);
+            let around = self.open[at] as usize;
+            let (scope, resumed) = match self.stacks.pop(&mut self.scopes[around].suspended) {
+                Some(scope) => (scope, true),
+                None => {
+                    self.scopes.push(Scope::default());
+                    (index(self.scopes.len() - 1), false)
                 }
-                None => Scope::default(),
             };
-            rest = outer.push(around).push(scope);
+            self.open.insert(at + 1, scope);
+            self.trail.push(Undo::Enter(index(at), resumed));
         }
-        Context::join(inner, rest)
     }
 }
 
@@ -198,26 +303,79 @@ impl Context {
 mod tests {
     use super::*;
 
+    /// Chainable versions of the changes, to write contexts as expressions.
+    impl Context {
+        fn take(mut self, level: u32, branch: u8) -> Context {
+            self.take_branch(level, branch);
+            self
+        }
+
+        fn abstraction(mut self, binder: usize) -> Context {
+            self.enter_abstraction(binder);
+            self
+        }
+
+        fn leave(mut self, level: u32, count: u32) -> Context {
+            self.leave_scopes(level, count);
+            self
+        }
+
+        fn enter(mut self, level: u32, count: u32) -> Context {
+            self.enter_scopes(level, count);
+            self
+        }
+
+        /// Everything a walk could read from the context: each open scope,
+        /// innermost first, with its binder, branches and suspended scopes.
+        fn reading(&self) -> Vec<String> {
+            self.open
+                .iter()
+                .rev()
+                .map(|&scope| self.render(scope))
+                .collect()
+        }
+
+        fn render(&self, scope: u32) -> String {
+            let scope = self.scopes[scope as usize];
+            let suspended: Vec<String> = self
+                .values(scope.suspended)
+                .into_iter()
+                .map(|inner| self.render(inner))
+                .collect();
+            let branches = self.values(scope.branches);
+            format!("{} {branches:?} {suspended:?}", scope.binder)
+        }
+
+        fn values(&self, mut top: u32) -> Vec<u32> {
+            let mut values = Vec::new();
+            while top != NONE {
+                let cell = self.stacks.cells[top as usize];
+                values.push(cell.value);
+                top = cell.below;
+            }
+            values
+        }
+    }
+
     /// Recalls branches at `level` until none is left.
     fn drain(mut context: Context, level: u32) -> Vec<u8> {
         let mut branches = Vec::new();
-        while let Some((branch, rest)) = context.recall_branch(level) {
+        while let Some(branch) = context.recall_branch(level) {
             branches.push(branch);
-            context = rest;
         }
         branches
     }
 
     #[test]
     fn branches_come_back_in_reverse_order() {
-        let context = Context::default().take_branch(0, 1).take_branch(0, 2);
+        let context = Context::default().take(0, 1).take(0, 2);
         assert_eq!(drain(context, 0), [2, 1]);
         assert_eq!(drain(Context::default(), 3), []);
     }
 
     #[test]
     fn levels_are_independent() {
-        let context = Context::default().take_branch(2, 1).take_branch(0, 2);
+        let context = Context::default().take(2, 1).take(0, 2);
         assert_eq!(drain(context.clone(), 0), [2]);
         assert_eq!(drain(context.clone(), 1), []);
         assert_eq!(drain(context, 2), [1]);
@@ -225,41 +383,41 @@ mod tests {
 
     #[test]
     fn abstractions_shift_outer_scopes() {
-        let context = Context::default().take_branch(0, 1).enter_abstraction(0);
+        let context = Context::default().take(0, 1).abstraction(0);
         assert_eq!(drain(context.clone(), 0), []);
         assert_eq!(drain(context, 1), [1]);
     }
 
     #[test]
     fn scopes_remember_their_abstraction() {
-        let context = Context::default().enter_abstraction(0);
+        let context = Context::default().abstraction(0);
         assert_eq!(context.binder(), Some(0));
-        let inner = context.take_branch(0, 1).enter_abstraction(1);
+        let inner = context.clone().take(0, 1).abstraction(1);
         assert_eq!(inner.binder(), Some(1));
         // Leaving the inner scope brings the outer abstraction back in view,
         // and coming back restores the inner one.
-        assert_eq!(inner.leave_scope(0).binder(), Some(0));
-        assert_eq!(inner.leave_scope(0).enter_scope(0).binder(), Some(1));
+        assert_eq!(inner.clone().leave(0, 1).binder(), Some(0));
+        assert_eq!(inner.leave(0, 1).enter(0, 1).binder(), Some(1));
         // A scope opened by a delimiter belongs to no abstraction.
-        assert_eq!(context.enter_scope(0).binder(), None);
+        assert_eq!(context.enter(0, 1).binder(), None);
         assert_eq!(Context::default().binder(), None);
     }
 
     #[test]
     fn leaving_and_entering_a_scope_restores_it() {
-        let inside = Context::default().take_branch(0, 1).take_branch(1, 2);
-        let outside = inside.leave_scope(0);
+        let inside = Context::default().take(0, 1).take(1, 2);
+        let outside = inside.leave(0, 1);
         // Outside, the old level 1 is level 0 and the left scope is hidden.
         assert_eq!(drain(outside.clone(), 0), [2]);
         // Work done outside stays outside.
-        let back = outside.take_branch(0, 1).enter_scope(0);
+        let back = outside.take(0, 1).enter(0, 1);
         assert_eq!(drain(back.clone(), 0), [1]);
         assert_eq!(drain(back, 1), [1, 2]);
     }
 
     #[test]
     fn entering_an_unknown_scope_opens_a_fresh_one() {
-        let context = Context::default().take_branch(0, 1).enter_scope(0);
+        let context = Context::default().take(0, 1).enter(0, 1);
         assert_eq!(drain(context.clone(), 0), []);
         assert_eq!(drain(context, 1), [1]);
     }
@@ -267,12 +425,12 @@ mod tests {
     #[test]
     fn scopes_nest() {
         let context = Context::default()
-            .take_branch(0, 1)
-            .leave_scope(0)
-            .take_branch(0, 2)
-            .leave_scope(0)
-            .enter_scope(0)
-            .enter_scope(0);
+            .take(0, 1)
+            .leave(0, 1)
+            .take(0, 2)
+            .leave(0, 1)
+            .enter(0, 1)
+            .enter(0, 1);
         assert_eq!(drain(context.clone(), 0), [1]);
         assert_eq!(drain(context, 1), [2]);
     }
@@ -280,24 +438,64 @@ mod tests {
     #[test]
     fn stacks_of_scopes_open_and_close_together() {
         let inside = Context::default()
-            .take_branch(0, 1)
-            .enter_abstraction(0)
-            .take_branch(0, 2)
-            .enter_abstraction(1);
-        let outside = inside.leave_scopes(0, 2);
+            .take(0, 1)
+            .abstraction(0)
+            .take(0, 2)
+            .abstraction(1);
+        let outside = inside.leave(0, 2);
         assert_eq!(outside.binder(), None);
-        let back = outside.enter_scopes(0, 2);
+        let back = outside.enter(0, 2);
         assert_eq!(back.binder(), Some(1));
         assert_eq!(drain(back.clone(), 1), [2]);
         assert_eq!(drain(back, 2), [1]);
     }
 
     #[test]
-    fn long_stacks_drop_without_recursion() {
+    fn restoring_a_mark_takes_back_every_change_since() {
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut random = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound) as u32
+        };
         let mut context = Context::default();
-        for _ in 0..1_000_000 {
-            context = context.take_branch(0, 1);
+        let mut saved: Vec<(Mark, Vec<String>)> = Vec::new();
+        for step in 0..3_000 {
+            if random(8) == 0 {
+                saved.push((context.mark(), context.reading()));
+            }
+            let level = random(6);
+            match random(6) {
+                0 => context.take_branch(level, random(2) as u8 + 1),
+                1 => {
+                    context.recall_branch(level);
+                }
+                2 => context.leave_scopes(level, random(3) + 1),
+                3 => context.enter_scopes(level, random(3) + 1),
+                4 => context.enter_abstraction(step),
+                _ => {
+                    // Go back to a random earlier mark, dropping the later
+                    // ones, as the walk does.
+                    if !saved.is_empty() {
+                        let keep = random(saved.len() as u64) as usize;
+                        let (mark, reading) = saved[keep].clone();
+                        saved.truncate(keep);
+                        context.restore(mark);
+                        assert_eq!(context.reading(), reading);
+                    }
+                }
+            }
         }
-        drop(context);
+        context.restore(0);
+        assert!(context.open.is_empty() && context.scopes.is_empty());
+        // Every cell is back on the free list.
+        let mut free = 0;
+        let mut cell = context.stacks.free;
+        while cell != NONE {
+            free += 1;
+            cell = context.stacks.cells[cell as usize].below;
+        }
+        assert_eq!(free, context.stacks.cells.len());
     }
 }
