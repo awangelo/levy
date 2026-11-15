@@ -45,10 +45,7 @@ Enter a term to reduce it, or `name = term` to define a name.
 | `3` | the Church numeral for 3, up to 10000 |
 | `-- text` | comment |
 
-Definitions are expanded when a term is parsed, so a definition cannot refer
-to itself: recursion goes through a fixed-point combinator, like `fix` in the
-prelude. A name used before it is defined stays a free variable, and the REPL
-points it out.
+Definitions are expanded when a term is parsed, so a definition cannot refer to itself: recursion goes through a fixed-point combinator, like `fix` in the prelude. A name used before it is defined stays a free variable, and the REPL points it out.
 
 ### Commands
 
@@ -64,20 +61,13 @@ points it out.
 
 ### Stopping
 
-An evaluation stops when you press Ctrl-C or when it runs out of fuel, and
-either way the session goes on. Fuel bounds the work, and with it the time
-and memory, of one evaluation: 100 million steps unless `:fuel` sets another
-limit.
+An evaluation stops when you press Ctrl-C or when it runs out of fuel, and either way the session goes on. Fuel bounds the work, and with it the time and memory, of one evaluation: 100 million steps unless `:fuel` sets another limit.
 
 ### Files and scripts
 
-In a file, a statement runs on over the indented lines that follow it. A bad
-statement is reported with its line and column, and loading goes on with the
-next one.
+In a file, a statement runs on over the indented lines that follow it. A bad statement is reported with its line and column, and loading goes on with the next one.
 
-With `-e TERM`, or when standard input is not a terminal, nothing is asked:
-results go to standard output, errors to standard error, and the exit status
-is nonzero if a statement failed.
+With `-e TERM`, or when standard input is not a terminal, nothing is asked: results go to standard output, errors to standard error, and the exit status is nonzero if a statement failed.
 
 ```
 levy examples/prelude.lam -e 'fact 5' -e ':compare fib 10'
@@ -94,101 +84,46 @@ scripts/build-web.sh
 python3 -m http.server --directory web 8000
 ```
 
-Then open <http://localhost:8000>. The page shows the net, the term it stands
-for, the pair of nodes about to interact, and counters. Arrow keys step
-forwards and backwards, space plays, `b` runs to the next β-step and `f` fits
-the net in view. Ctrl+Enter in the script loads it. Finish and Next β can be
-stopped by pressing them again. Scroll or pinch to zoom, drag to pan.
+Then open <http://localhost:8000>. The page shows the net, the term it stands for, the pair of nodes about to interact, and counters. Arrow keys step forwards and backwards, space plays, `b` runs to the next β-step and `f` fits the net in view. Ctrl+Enter in the script loads it. Finish and Next β can be stopped by pressing them again. Scroll or pinch to zoom, drag to pan.
 
 ## How it works
 
-The algorithm is Lambdascope (van Oostrom, van de Looij and Zwitserlood,
-2004), the smallest known formulation of optimal reduction as an interaction
-net.
+levy follows Lambdascope (van Oostrom, van de Looij and Zwitserlood, 2004), the smallest known way to do optimal reduction with an interaction net. The idea is: turn the term into a graph that stores every shared piece once, rewrite that graph with a handful of local rules, and read a term back out of it whenever you want to look.
 
-1. **Translation** (`translate.rs`). Abstractions and applications become
-   nodes. A variable occurrence is a wire to its binder that passes one
-   *delimiter* per abstraction it leaves. A variable used several times is
-   shared by *fans*.
-2. **Rules** (`rules.rs`). Two nodes interact when their principal ports face
-   each other. *Beta* removes an application and its abstraction and leaves
-   two delimiters around the former body. Fans and delimiters of equal level
-   *annihilate*; a delimiter that reaches the root or a free variable
-   *dissolves*; any other pair with a fan or a delimiter in it *commutes*,
-   each node copying the other, with levels adjusted like de Bruijn indices.
-   One delimiter node stands for a whole stack of delimiters of the same
-   level, so that they move together.
-3. **Strategy** (`machine.rs`). The machine walks the net as one reads a term,
-   head first, and rewrites only the active pairs on its way. That is
-   leftmost-outermost order, so redexes nothing needs are never touched, and a
-   diverging argument that is discarded costs nothing. The walk keeps its
-   place between steps, so stepping costs no more than running, and it pays
-   one unit of fuel per node it comes to, which is what bounds a reduction
-   that does not end.
-4. **Readback** (`context.rs`, `machine.rs`). The same walk without rewriting
-   turns a net back into a term at any point. It carries a context that
-   records which fan branch it came through and which scopes it has left.
-   The walk only goes back to earlier contexts in the reverse of the order it
-   reached them, so there is one context, changed in place, with a log of
-   how to undo each change. A step costs about the same however deeply the
-   scopes nest.
-5. **Garbage collection** (`gc.rs`). Whatever a reading from the root cannot
-   reach is removed.
+1. **Translation** (`translate.rs`). Every abstraction and every application becomes a node, and every variable becomes a wire back to the abstraction that binds it. Each time that wire leaves an abstraction on its way, it passes through a *delimiter*, a node that marks the edge of a scope. A variable used more than once gets *fans*, which split its wire so that all the uses share it.
+2. **Rules** (`rules.rs`). Every node has one *principal* port, and two nodes interact only when their principal ports are wired to each other. There are four rules. *Beta* is the real computation: an application meets its abstraction, both disappear, and two delimiters are left around what used to be the body. Two fans, or two delimiters, of the same level *annihilate* each other. A delimiter that reaches the root or a free variable *dissolves*. Any other pair with a fan or a delimiter in it *commutes*: the two nodes pass through each other, each copied once for every auxiliary port of the other, with their levels adjusted much like de Bruijn indices. Delimiters of the same level that pile up are merged into one node, so a whole stack moves in a single step.
+3. **Strategy** (`machine.rs`). The machine walks the net the way you would read the term, head first, and rewrites only the interacting pairs it runs into. That is leftmost-outermost order, so a redex nothing needs is never touched, and an argument that would loop forever costs nothing if it is thrown away. The walk remembers where it stopped, so stepping through a reduction costs no more than running it in one go. Every node it visits costs one unit of fuel, which is what stops a reduction that would never end.
+4. **Readback** (`context.rs`, `machine.rs`). The same walk, with rewriting turned off, turns the net back into a term at any point. One node can stand for several places in the term, so the walk carries a *context* that remembers which fan branches it came through and which scopes it has left. It only ever goes back to an earlier context in the reverse of the order it reached them, so it keeps a single context, changes it in place, and logs how to undo each change. A step costs about the same however deeply the scopes nest.
+5. **Garbage collection** (`gc.rs`). Anything a reading from the root can no longer reach is thrown away.
 
 ## How it is checked
 
-`reference.rs` is a plain normal-order reducer over Lévy-labelled terms. It
-gives the normal form and the number of redex families, which is the number of
-β-steps an optimal reducer must take. The tests in
-`crates/core/tests/differential.rs` compare the machine with it on every
-closed term up to 10 nodes, on 63,000 random terms of 10 to 200 nodes, with
-and without free variables, and on a corpus of classic examples written with
-the prelude. They require equal normal forms and exactly one beta interaction
-per family. They also check that
+levy is tested against a much simpler reducer that is easy to trust. `reference.rs` does plain normal-order reduction on terms that carry Lévy labels, which gives both the normal form and the number of redex families: exactly the number of β-steps an optimal reducer has to take.
 
-- no rule other than beta changes the term a net stands for, watching every
-  kind of interaction at least twenty times;
-- a reduction gives the same result and the same counts whether it runs in
-  one go, one interaction at a time, in batches, in slices of fuel, or with
-  garbage collected after every interaction;
-- a term without a normal form stops at the fuel limit.
+`crates/core/tests/differential.rs` runs both of them on every closed term of up to 10 nodes, on 63,000 random terms of 10 to 200 nodes, with and without free variables, and on a set of classic examples written with the prelude. The normal forms have to match, and levy has to fire exactly one beta interaction per family. The tests also check that:
+
+- no rule but beta changes the term a net stands for, with every kind of interaction watched at least twenty times;
+- a reduction ends with the same result and the same counts whether it runs in one go, one interaction at a time, in batches, in slices of fuel, or with garbage collected after every interaction;
+- a term with no normal form stops at the fuel limit.
 
 ```
 cargo test --release
 ```
 
-The random terms come from a fixed seed. `LEVY_TEST_SEED=7 cargo test` tries
-others.
+The random terms come from a fixed seed, so a failure can always be reproduced. To try other terms, set `LEVY_TEST_SEED`, as in `LEVY_TEST_SEED=7 cargo test --release`.
 
 ## Limitations
 
-- **Optimal in β-steps, not in time.** The bookkeeping that keeps sharing
-  correct dominates: `fib 20` takes 283 β-steps and 635,474 bookkeeping
-  interactions. Stacked delimiters are merged, which cuts that work by up to
-  three (2.4 on `fib 20`, little where few delimiters pile up), but the other
-  known remedies (safe fans, garbage collection of fans with a dead branch)
-  are not implemented. On ordinary programs a conventional lazy evaluator is
-  much faster; this one wins only when sharing under binders matters.
-- **Normal forms stay shared.** The net of a normal form can hold fans and
-  delimiters that nothing will ever move. Reading it back gives the plain
-  term, but the picture of it is larger than the term.
-- **A large result needs fuel.** Reading a result costs one unit of fuel per
-  node, and the REPL allows 100 million units, a few seconds, per
-  evaluation. A result of 50 million nodes needs `:fuel` raised, and about
-  75 bytes of memory per node.
-- **Sequential.** Reducing active pairs in parallel would contract redexes
-  that are not needed and lose optimality.
-- **Family counts are fingerprints.** The reference reducer hashes Lévy labels
-  instead of storing them, so the count it reports could in principle be off
-  by a collision. The odds are negligible.
-- **The page draws up to 700 nodes.** Larger nets can still be stepped, with
-  the term and the counters as the only feedback.
+- **Optimal in β-steps, not in time.** Keeping the sharing correct takes a lot of bookkeeping, and the bookkeeping dominates: `fib 20` takes 283 β-steps but 635,474 bookkeeping interactions. Merging stacked delimiters cuts that work by up to a factor of three (2.4 on `fib 20`, much less where few delimiters pile up), but other known remedies, such as safe fans or collecting fans with a dead branch, are not implemented. On everyday programs a conventional lazy evaluator is much faster; levy wins when sharing under binders really matters.
+- **Normal forms stay shared.** The net of a normal form can still hold fans and delimiters that will never move again. Reading it back gives the plain term, but the picture on the page is bigger than the term.
+- **Big results need fuel.** Reading a result costs one unit of fuel per node, and the REPL allows 100 million of them per evaluation, a few seconds of work. A result of 50 million nodes needs a higher `:fuel`, and about 75 bytes of memory per node.
+- **One pair at a time.** Reducing interacting pairs in parallel would contract redexes that are not needed, and optimality would be lost.
+- **Family counts are fingerprints.** The reference reducer hashes Lévy labels instead of storing them, so in principle a collision could throw its count off. The odds are negligible.
+- **The page draws up to 700 nodes.** Bigger nets can still be stepped through, with the term and the counters as the only feedback.
 
 ## References
 
 - J.-J. Lévy, *Réductions correctes et optimales dans le lambda-calcul*, 1978.
 - J. Lamping, *An algorithm for optimal lambda calculus reduction*, POPL 1990.
-- A. Asperti and S. Guerrini, *The Optimal Implementation of Functional
-  Programming Languages*, Cambridge University Press, 1998.
-- V. van Oostrom, K.-J. van de Looij and M. Zwitserlood, *Lambdascope: another
-  optimal implementation of the lambda-calculus*, 2004.
+- A. Asperti and S. Guerrini, *The Optimal Implementation of Functional Programming Languages*, Cambridge University Press, 1998.
+- V. van Oostrom, K.-J. van de Looij and M. Zwitserlood, *Lambdascope: another optimal implementation of the lambda-calculus*, 2004.
