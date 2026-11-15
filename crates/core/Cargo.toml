@@ -3,6 +3,7 @@ name = "levy-core"
 description = "Lévy-optimal λ-calculus reduction on Lambdascope interaction nets"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
 
 [lints]
 workspace = true

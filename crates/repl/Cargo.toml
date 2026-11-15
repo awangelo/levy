@@ -3,6 +3,7 @@ name = "levy"
 description = "A REPL for Lévy-optimal λ-calculus reduction"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
 
 [dependencies]
 ctrlc = "3.5"

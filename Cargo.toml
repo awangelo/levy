@@ -5,6 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/awangelo/levy"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
