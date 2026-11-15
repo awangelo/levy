@@ -1,9 +1,6 @@
 # levy
 
-An interpreter for the untyped λ-calculus that reduces terms optimally in
-Lévy's sense: every family of redexes is contracted exactly once, however many
-copies of it ordinary reduction would create. It comes with a REPL and a web
-page that steps through the reduction one graph rewrite at a time.
+An untyped λ-calculus interpreter that reduces terms optimally in Lévy’s sense: it contracts each family of redexes once, no matter how many copies ordinary reduction would create. It includes a REPL and an interactive web page that shows each graph rewrite step.
 
 ```
 λ> :compare 2 2 2 2 id id
@@ -12,7 +9,7 @@ optimal:      27 β-steps, 1151 bookkeeping steps
 normal order: 258294 β-steps in 27 families
 ```
 
-(`id` is `\x. x`, from `examples/prelude.lam`.)
+(`id` is `\x. x`, from `examples/prelude.lam`)
 
 ## Layout
 
@@ -39,18 +36,44 @@ Enter a term to reduce it, or `name = term` to define a name.
 λ> :help
 ```
 
-Syntax: `\x. body` or `λx. body`, application by juxtaposition, numbers up to
-10000 for Church numerals, `--` for comments. Definitions are expanded when a
-term is parsed, so recursion needs a fixed-point combinator, and a name used
-before it is defined stays a free variable. The REPL says so when it happens.
+### Syntax
 
-Ctrl-C stops an evaluation and keeps the session. So does the fuel limit,
-which bounds the work of one evaluation, and with it its time and memory:
-`:fuel` shows it and `:fuel N` sets it.
+| Form | Meaning |
+|---|---|
+| `\x. body` or `λx. body` | abstraction; `\x y. body` binds several names |
+| `f a b` | application, associating to the left |
+| `3` | the Church numeral for 3, up to 10000 |
+| `-- text` | comment |
 
-In a file, a statement runs on over the indented lines that follow it.
-`:load` reports a bad statement with its line and column and goes on with
-the next one.
+Definitions are expanded when a term is parsed, so a definition cannot refer
+to itself: recursion goes through a fixed-point combinator, like `fix` in the
+prelude. A name used before it is defined stays a free variable, and the REPL
+points it out.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `:compare TERM` | reduce `TERM` both optimally and in normal order |
+| `:trace TERM` | show the term after each β-step, up to 100 of them |
+| `:dot TERM` | print the net of `TERM` in Graphviz format |
+| `:load FILE` | run the statements of a file |
+| `:defs` | list the definitions |
+| `:fuel [N]` | show or set the limit on the work of one evaluation |
+| `:help`, `:quit` | list the commands, leave |
+
+### Stopping
+
+An evaluation stops when you press Ctrl-C or when it runs out of fuel, and
+either way the session goes on. Fuel bounds the work, and with it the time
+and memory, of one evaluation: 100 million steps unless `:fuel` sets another
+limit.
+
+### Files and scripts
+
+In a file, a statement runs on over the indented lines that follow it. A bad
+statement is reported with its line and column, and loading goes on with the
+next one.
 
 With `-e TERM`, or when standard input is not a terminal, nothing is asked:
 results go to standard output, errors to standard error, and the exit status
