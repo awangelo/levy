@@ -17,15 +17,6 @@ const RULES = {
   dissolve: ["Dissolve", "a delimiter reaches the root or a free variable and vanishes."],
 };
 
-const PRELUDE = `true  = \\a b. a
-false = \\a b. b
-times = \\m n f. m (n f)
-iszero = \\n. n (\\x. false) true
-pred  = \\n f x. n (\\g h. h (g f)) (\\u. x) (\\u. u)
-fix   = \\f. (\\x. f (x x)) (\\x. f (x x))
-fact  = fix (\\self n. iszero n 1 (times n (self (pred n))))
-`;
-
 const EXAMPLES = [
   ["A shared redex", "-- The argument is used twice but reduced once.\n(\\x. f x x) ((\\y. y) a)\n"],
   ["Two applied to two", "two = \\f x. f (f x)\ntwo two\n"],
@@ -35,7 +26,7 @@ const EXAMPLES = [
   ["Lamping's example", "(\\g. g (g (\\x. x))) (\\h. (\\f. f (f (\\z. z))) (\\w. h (w (\\y. y))))\n"],
   ["An abstraction inside its own copy", "\\x. (\\f. f f) (\\g. x (\\y. g y))\n"],
   ["Exponentiation", "-- 2 ^ (2 ^ 2), then applied to two identities.\n2 2 2 (\\x. x) (\\x. x)\n"],
-  ["Factorial of two", `${PRELUDE}\nfact 2\n`],
+  ["Factorial of two", "-- `fact` comes from the prelude, as do `eq`, `pair`, `fib` and the rest.\nfact 2\n"],
 ];
 
 const $ = (id) => document.getElementById(id);

@@ -129,11 +129,28 @@ pub struct Stepper {
     snapshot_slots: usize,
 }
 
+/// The definitions every script starts with: those of the REPL's prelude,
+/// built into the package because the page cannot read files beside it.
+const PRELUDE: &str = include_str!("../../../examples/prelude.lam");
+
+/// The definitions of [`PRELUDE`].
+fn prelude() -> Definitions {
+    let mut definitions = Definitions::new();
+    for (_, source) in statements(PRELUDE) {
+        // A test makes sure that every statement is a definition.
+        if let Ok(Some(Statement::Define(name, body))) = definitions.statement(source) {
+            definitions.define(name, body);
+        }
+    }
+    definitions
+}
+
 impl Stepper {
     /// Loads a script: definitions, then the term to reduce. If the script
-    /// holds several terms, the last one is reduced.
+    /// holds several terms, the last one is reduced. The definitions of the
+    /// prelude come first, so the script can use them or define them anew.
     pub fn load(script: &str) -> Result<Stepper, String> {
-        let mut definitions = Definitions::new();
+        let mut definitions = prelude();
         let mut term: Option<Term> = None;
         for (line, source) in statements(script) {
             match definitions.statement(source) {
@@ -390,14 +407,6 @@ mod tests {
     use super::*;
 
     const SCRIPT: &str = "-- two applied to itself\ntwo = \\f x. f (f x)\ntwo two\n";
-    const FACTORIAL: &str = "true  = \\a b. a
-false = \\a b. b
-times = \\m n f. m (n f)
-iszero = \\n. n (\\x. false) true
-pred  = \\n f x. n (\\g h. h (g f)) (\\u. x) (\\u. u)
-fix   = \\f. (\\x. f (x x)) (\\x. f (x x))
-fact  = fix (\\self n. iszero n 1 (times n (self (pred n))))
-";
     /// Two to the fourth, applied to two identities: a few hundred steps.
     const EXPONENT: &str = "2 2 2 (\\x. x) (\\x. x)";
     /// More nodes than any net of these tests has.
@@ -409,6 +418,28 @@ fact  = fix (\\self n. iszero n 1 (times n (self (pred n))))
             steps += 1;
         }
         steps
+    }
+
+    #[test]
+    fn the_prelude_is_built_in() {
+        let mut definitions = Definitions::new();
+        for (line, source) in statements(PRELUDE) {
+            match definitions.statement(source) {
+                Ok(Some(Statement::Define(name, body))) => definitions.define(name, body),
+                // Comments.
+                Ok(None) => {}
+                other => panic!("prelude line {line} is not a definition: {other:?}"),
+            }
+        }
+        assert_eq!(prelude().len(), definitions.len());
+        // A script can use the prelude without defining anything...
+        let mut stepper = Stepper::load("eq (fact 3) (plus 2 4) yes no").unwrap();
+        run_to_end(&mut stepper);
+        assert_eq!(stepper.frame(ALL).term, "yes");
+        // ...and replace a definition of it.
+        let mut stepper = Stepper::load("id = \\x. x x\nid y").unwrap();
+        run_to_end(&mut stepper);
+        assert_eq!(stepper.frame(ALL).term, "y y");
     }
 
     #[test]
@@ -583,7 +614,7 @@ fact  = fix (\\self n. iszero n 1 (times n (self (pred n))))
     fn frames_are_consistent_pictures() {
         for script in [
             SCRIPT.to_owned(),
-            format!("{FACTORIAL}fact 2"),
+            "fact 2".to_owned(),
             "2 2 2 (\\x. x) (\\x. x)".to_owned(),
             "\\x. (\\f. f f) (\\g. x (\\y. g y))".to_owned(),
         ] {

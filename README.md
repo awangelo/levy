@@ -84,7 +84,7 @@ scripts/build-web.sh
 python3 -m http.server --directory web 8000
 ```
 
-Then open <http://localhost:8000>. The page shows the net, the term it stands for, the pair of nodes about to interact, and counters. Arrow keys step forwards and backwards, space plays, `b` runs to the next β-step and `f` fits the net in view. Ctrl+Enter in the script loads it. Finish and Next β can be stopped by pressing them again. Scroll or pinch to zoom, drag to pan.
+Then open <http://localhost:8000>. The page shows the net, the term it stands for, the pair of nodes about to interact, and counters. Arrow keys step forwards and backwards, space plays, `b` runs to the next β-step and `f` fits the net in view. Ctrl+Enter in the script loads it, and scripts can use every definition in `examples/prelude.lam`. Finish and Next β can be stopped by pressing them again. Scroll or pinch to zoom, drag to pan.
 
 ## How it works
 
