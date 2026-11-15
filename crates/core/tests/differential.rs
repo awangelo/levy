@@ -1,34 +1,48 @@
 //! Differential tests: the optimal machine against the reference reducer.
 //!
-//! Three properties are checked, on every closed term up to a small size, on
-//! random larger terms, and on a corpus of classic examples:
+//! Four properties are checked, on every closed term up to a small size, on
+//! random larger terms with and without free variables, and on a corpus of
+//! classic examples:
 //!
 //! 1. reading back a freshly translated net gives the term back;
 //! 2. the machine and the reference reducer agree on the normal form, and the
 //!    machine fires exactly one beta interaction per redex family;
-//! 3. no rule other than beta changes the term a net stands for.
+//! 3. no rule other than beta changes the term a net stands for;
+//! 4. it makes no difference whether a reduction runs in one go, one
+//!    interaction at a time, in slices of fuel, or with garbage collected
+//!    at every turn.
+//!
+//! The random terms come from a fixed seed, so a failure can be reproduced.
+//! Set `LEVY_TEST_SEED` to a number to try other terms.
+//!
+//! Nothing here asks for a large stack: the engine does not recurse, and
+//! these tests would overflow the stack of a test thread if it did.
+
+use std::collections::BTreeMap;
 
 use levy_core::machine::readback;
+use levy_core::net::Kind;
+use levy_core::script::statements;
 use levy_core::translate::translate;
-use levy_core::{Halt, Machine, Rule, Term, parse_with, reference};
+use levy_core::{Definitions, Halt, Machine, Rule, Statement, Term, reference};
 
 /// Budget of the reference reducer, in beta-steps plus copied nodes.
 const REFERENCE_BUDGET: u64 = 20_000;
-/// Fuel of the machine, in interactions.
+/// Fuel of the machine, in steps of its walk.
 const MACHINE_FUEL: u64 = 5_000_000;
+/// Fuel of the machine on a term the reference reducer gives up on. Such a
+/// term diverges as a rule, so this is what the machine is expected to burn.
+const DIVERGENCE_FUEL: u64 = 10_000;
 
-/// Runs `test` on a thread with a stack large enough for deep terms.
-///
-/// Terms are trees walked by recursion, and a Church numeral nests as deep
-/// as its value, which is more than the default stack of a test thread
-/// allows.
-fn with_deep_stack(test: impl FnOnce() + Send + 'static) {
-    let thread = std::thread::Builder::new()
-        .stack_size(1 << 30)
-        .spawn(test)
-        .expect("the test thread starts");
-    if let Err(panic) = thread.join() {
-        std::panic::resume_unwind(panic);
+/// The seed of the random terms: fixed, unless the environment gives one.
+fn seed(default: u64) -> u64 {
+    match std::env::var("LEVY_TEST_SEED") {
+        Ok(text) => {
+            let given: u64 = text.parse().expect("LEVY_TEST_SEED is a number");
+            println!("random terms from LEVY_TEST_SEED={given}");
+            given ^ default
+        }
+        Err(_) => default,
     }
 }
 
@@ -63,6 +77,16 @@ fn closed_terms(size: usize) -> impl Iterator<Item = Term> {
     (1..=size).flat_map(|size| terms(size, 0))
 }
 
+/// What the random terms look like.
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    /// The chance in ten that an application gets an abstraction as its
+    /// function, which makes it a redex.
+    redexes: usize,
+    /// The chance in ten that a variable is a free one.
+    free: usize,
+}
+
 /// A SplitMix64 generator: small, seedable and good enough to scatter terms.
 struct Random(u64);
 
@@ -79,27 +103,119 @@ impl Random {
     }
 
     /// A random term of roughly `size` nodes with free indices below `depth`.
-    ///
-    /// `redexes` is the chance in ten that an application gets an abstraction
-    /// as its function, which makes it a redex.
-    fn term(&mut self, size: usize, depth: usize, redexes: usize) -> Term {
-        if size <= 1 && depth > 0 {
-            Term::Var(self.below(depth))
-        } else if size <= 2 || depth == 0 || self.below(5) < 2 {
-            self.abstraction(size, depth, redexes)
+    /// The top of the term is as likely to be an application as anything
+    /// below it is.
+    fn term(&mut self, size: usize, depth: usize, shape: Shape) -> Term {
+        const FREE: [&str; 3] = ["p", "q", "r"];
+        if size <= 1 {
+            if self.below(10) < shape.free {
+                Term::free(FREE[self.below(FREE.len())])
+            } else if depth > 0 {
+                Term::Var(self.below(depth))
+            } else {
+                // A closed term has no variable to put here.
+                Term::lam("x", Term::Var(0))
+            }
+        } else if size == 2 || self.below(5) < 2 {
+            self.abstraction(size, depth, shape)
         } else {
             let left = 1 + self.below(size - 2);
-            let func = if self.below(10) < redexes {
-                self.abstraction(left, depth, redexes)
+            let func = if self.below(10) < shape.redexes {
+                self.abstraction(left, depth, shape)
             } else {
-                self.term(left, depth, redexes)
+                self.term(left, depth, shape)
             };
-            Term::app(func, self.term(size - 1 - left, depth, redexes))
+            Term::app(func, self.term(size - 1 - left, depth, shape))
         }
     }
 
-    fn abstraction(&mut self, size: usize, depth: usize, redexes: usize) -> Term {
-        Term::lam("x", self.term(size.saturating_sub(1), depth + 1, redexes))
+    fn abstraction(&mut self, size: usize, depth: usize, shape: Shape) -> Term {
+        Term::lam("x", self.term(size.saturating_sub(1), depth + 1, shape))
+    }
+}
+
+/// The interaction a pair of nodes is about to have, as a short name.
+fn variant(machine: &Machine) -> Option<String> {
+    let name = |kind: Kind| match kind {
+        Kind::Root => "root",
+        Kind::Lam { .. } => "abstraction",
+        Kind::App => "application",
+        Kind::Fan { .. } => "fan",
+        Kind::Delim { .. } => "delimiter",
+        Kind::Eraser => "eraser",
+        Kind::Free { .. } => "free variable",
+    };
+    let redex = machine.next().expect("the net is sound")?;
+    let (upper, lower) = (
+        machine.net().kind(redex.upper),
+        machine.net().kind(redex.lower),
+    );
+    let mut pair = [name(upper), name(lower)];
+    pair.sort_unstable();
+    let rule = match (redex.rule, upper, lower) {
+        (Rule::Annihilate, Kind::Delim { count: a, .. }, Kind::Delim { count: b, .. })
+            if a != b =>
+        {
+            "annihilate in part".to_owned()
+        }
+        (rule, ..) => format!("{rule:?}").to_lowercase(),
+    };
+    Some(format!("{rule}: {} and {}", pair[0], pair[1]))
+}
+
+/// Every way two nodes can interact.
+const VARIANTS: [&str; 14] = [
+    "beta: abstraction and application",
+    "annihilate: fan and fan",
+    "annihilate: delimiter and delimiter",
+    "annihilate in part: delimiter and delimiter",
+    "commute: fan and fan",
+    "commute: delimiter and fan",
+    "commute: delimiter and delimiter",
+    "commute: abstraction and fan",
+    "commute: application and fan",
+    "commute: abstraction and delimiter",
+    "commute: application and delimiter",
+    "commute: fan and free variable",
+    "dissolve: delimiter and free variable",
+    "dissolve: delimiter and root",
+];
+
+/// Reduces `term` one interaction at a time and checks that nothing but a
+/// beta changes the term the net stands for, and that every beta keeps it
+/// within the reduction to `normal`, if that is known. Counts the kinds of
+/// interaction it sees.
+fn check_steps(term: &Term, normal: Option<&Term>, seen: &mut BTreeMap<String, u64>) {
+    let mut machine = Machine::new(term).expect("the term has no unbound index");
+    let mut current = term.clone();
+    for _ in 0..400 {
+        let Some(expected) = variant(&machine) else {
+            assert_eq!(machine.step(), Ok(None), "{term}");
+            break;
+        };
+        let rule = machine
+            .step()
+            .unwrap_or_else(|halt| panic!("{term}: {halt}"))
+            .unwrap_or_else(|| panic!("{term}: {expected} was announced and nothing fired"));
+        assert!(
+            expected.starts_with(&format!("{rule:?}").to_lowercase()),
+            "{term}: {expected} was announced and {rule:?} fired"
+        );
+        *seen.entry(expected).or_default() += 1;
+        assert_eq!(machine.net().check(), Ok(()), "{term}");
+        let next = machine
+            .readback()
+            .unwrap_or_else(|halt| panic!("{term}: after {rule:?}: {halt}"));
+        if rule == Rule::Beta {
+            if let Some(normal) = normal {
+                let reduct = reference::normalize(&next, REFERENCE_BUDGET * 10)
+                    .unwrap_or_else(|_| panic!("{term}: {next} does not normalize"));
+                assert_eq!(&reduct.normal_form, normal, "{term}");
+            }
+        } else {
+            assert_eq!(next, current, "{term}: {rule:?} changed the term");
+        }
+        current = next;
     }
 }
 
@@ -116,17 +232,21 @@ struct Tally {
     optimal_steps: u64,
     /// Compared terms on which sharing saved at least one step.
     shared: u64,
+    /// Compared terms that took more than five beta interactions.
+    long: u64,
+    /// Nodes the machine collected as garbage on its way.
+    collected: u64,
 }
 
 impl Tally {
     /// Runs both reducers on `term` and checks them against each other.
     fn compare(&mut self, term: &Term, budget: u64) {
-        let mut machine = Machine::new(term).expect("the term is closed");
+        let mut machine = Machine::new(term).expect("the term has no unbound index");
         let Ok(expected) = reference::normalize(term, budget) else {
             // The term diverges or explodes under substitution. The machine
             // may still succeed, but whatever it does it must keep the net
-            // sound.
-            let outcome = machine.normalize(10_000);
+            // sound, and its fuel must stop it.
+            let outcome = machine.normalize(DIVERGENCE_FUEL);
             assert!(
                 !matches!(outcome, Err(Halt::Malformed(_))),
                 "{term}: {outcome:?}"
@@ -148,25 +268,40 @@ impl Tally {
         self.normal_order_steps += expected.beta_steps;
         self.optimal_steps += expected.families;
         self.shared += u64::from(expected.families < expected.beta_steps);
+        self.long += u64::from(expected.families > 5);
+        self.collected += machine.stats().collected;
     }
 
     fn report(&self, what: &str) {
         println!(
             "{what}: {} compared, {} skipped, {} normal-order steps, {} optimal steps, \
-             sharing helped on {}",
-            self.compared, self.skipped, self.normal_order_steps, self.optimal_steps, self.shared
+             sharing helped on {}, {} took more than 5 steps",
+            self.compared,
+            self.skipped,
+            self.normal_order_steps,
+            self.optimal_steps,
+            self.shared,
+            self.long
         );
     }
 }
 
 #[test]
 fn readback_inverts_translation() {
-    with_deep_stack(check_readback_inverts_translation);
-}
-
-fn check_readback_inverts_translation() {
     for term in closed_terms(9) {
         let net = translate(&term).expect("the term is closed");
+        assert_eq!(net.check(), Ok(()), "{term}");
+        assert_eq!(readback(&net), Ok(term.clone()), "{term}");
+    }
+    let mut random = Random(seed(0x0BAC));
+    for round in 0..4_000 {
+        let shape = Shape {
+            redexes: round % 10,
+            free: round % 4,
+        };
+        let size = 10 + random.below(190);
+        let term = random.term(size, 0, shape);
+        let net = translate(&term).expect("the term has no unbound index");
         assert_eq!(net.check(), Ok(()), "{term}");
         assert_eq!(readback(&net), Ok(term.clone()), "{term}");
     }
@@ -174,91 +309,215 @@ fn check_readback_inverts_translation() {
 
 #[test]
 fn small_terms_agree_with_the_reference() {
-    with_deep_stack(check_small_terms_agree_with_the_reference);
-}
-
-fn check_small_terms_agree_with_the_reference() {
     let mut tally = Tally::default();
     for term in closed_terms(10) {
         tally.compare(&term, REFERENCE_BUDGET);
     }
     tally.report("closed terms up to size 10");
-    assert!(
-        tally.compared > 9 * tally.skipped,
-        "too few terms were compared"
-    );
-    assert!(tally.shared > 0, "no term exercised sharing");
+    assert_eq!(tally.compared + tally.skipped, 10_180);
+    // The four that are skipped are the ones that diverge.
+    assert!(tally.skipped <= 4, "too few terms were compared");
+    assert!(tally.shared >= 5, "too few terms exercised sharing");
 }
 
 #[test]
 fn random_terms_agree_with_the_reference() {
-    with_deep_stack(check_random_terms_agree_with_the_reference);
+    let mut random = Random(seed(0x5EED));
+    let mut total = Tally::default();
+    for redexes in [0, 5, 9] {
+        for free in [0, 3] {
+            let shape = Shape { redexes, free };
+            let mut tally = Tally::default();
+            for _ in 0..10_000 {
+                let size = 10 + random.below(40);
+                tally.compare(&random.term(size, 0, shape), REFERENCE_BUDGET);
+            }
+            tally.report(&format!("random terms, {shape:?}"));
+            assert!(
+                tally.compared > 20 * tally.skipped,
+                "too few terms were compared"
+            );
+            total.compared += tally.compared;
+            total.shared += tally.shared;
+            total.long += tally.long;
+        }
+    }
+    // The terms are worth their while only if they are not all trivial.
+    assert!(
+        total.shared * 100 > total.compared,
+        "too few terms exercised sharing: {} of {}",
+        total.shared,
+        total.compared
+    );
+    assert!(
+        total.long * 20 > total.compared,
+        "too few terms took a while: {} of {}",
+        total.long,
+        total.compared
+    );
 }
 
-fn check_random_terms_agree_with_the_reference() {
-    let mut random = Random(0x5EED);
-    for redexes in [0, 5, 9] {
-        let mut tally = Tally::default();
-        for _ in 0..20_000 {
-            let size = 10 + random.below(40);
-            tally.compare(&random.term(size, 0, redexes), REFERENCE_BUDGET);
-        }
-        tally.report(&format!("random terms, redex bias {redexes}/10"));
-        assert!(
-            tally.compared > tally.skipped,
-            "too few terms were compared"
-        );
-        assert!(tally.shared > 0, "no term exercised sharing");
+#[test]
+fn large_random_terms_agree_with_the_reference() {
+    let mut random = Random(seed(0x1A26E));
+    let mut tally = Tally::default();
+    for round in 0..3_000 {
+        let shape = Shape {
+            redexes: [3, 6, 9][round % 3],
+            free: [0, 1, 4][round % 3],
+        };
+        let size = 50 + random.below(150);
+        tally.compare(&random.term(size, 0, shape), REFERENCE_BUDGET);
     }
+    tally.report("random terms of 50 to 200 nodes");
+    assert!(
+        tally.compared > 5 * tally.skipped,
+        "too few terms were compared"
+    );
+    assert!(
+        tally.long * 2 > tally.compared,
+        "too few terms took a while"
+    );
 }
 
 #[test]
 fn only_beta_changes_the_term() {
-    with_deep_stack(check_only_beta_changes_the_term);
-}
-
-fn check_only_beta_changes_the_term() {
+    let mut seen = BTreeMap::new();
     for term in closed_terms(8) {
         let expected = reference::normalize(&term, REFERENCE_BUDGET).ok();
-        let mut machine = Machine::new(&term).expect("the term is closed");
-        let mut current = term.clone();
-        for _ in 0..400 {
-            let Some(rule) = machine
-                .step()
-                .unwrap_or_else(|halt| panic!("{term}: {halt}"))
-            else {
-                break;
-            };
-            assert_eq!(machine.net().check(), Ok(()), "{term}");
-            let next = machine
-                .readback()
-                .unwrap_or_else(|halt| panic!("{term}: after {rule:?}: {halt}"));
-            if rule == Rule::Beta {
-                // The step must stay within the reduction of the term.
-                if let Some(expected) = &expected {
-                    let reduct = reference::normalize(&next, REFERENCE_BUDGET * 10)
-                        .unwrap_or_else(|_| panic!("{term}: {next} does not normalize"));
-                    assert_eq!(reduct.normal_form, expected.normal_form, "{term}");
-                }
-            } else {
-                assert_eq!(next, current, "{term}: {rule:?} changed the term");
-            }
-            current = next;
-        }
+        check_steps(
+            &term,
+            expected.as_ref().map(|it| &it.normal_form),
+            &mut seen,
+        );
     }
+    let mut random = Random(seed(0x0B5E));
+    for round in 0..1_500 {
+        let shape = Shape {
+            redexes: [2, 5, 9][round % 3],
+            free: [0, 3][round % 2],
+        };
+        let size = 10 + random.below(50);
+        let term = random.term(size, 0, shape);
+        let expected = reference::normalize(&term, REFERENCE_BUDGET).ok();
+        check_steps(
+            &term,
+            expected.as_ref().map(|it| &it.normal_form),
+            &mut seen,
+        );
+    }
+    for source in [
+        r"2 2 2",
+        r"plus 2 3",
+        r"pred 3",
+        r"(\x. x x) (\y. (\z. z) y) w",
+        r"fst (pair a ((\x. x x) (\x. x x)))",
+        r"(\twice. twice twice inc) (\f x. f (f x))",
+    ] {
+        let term = corpus_term(source);
+        let expected = reference::normalize(&term, REFERENCE_BUDGET * 10).ok();
+        check_steps(
+            &term,
+            expected.as_ref().map(|it| &it.normal_form),
+            &mut seen,
+        );
+    }
+    println!("{seen:#?}");
+    // Every kind of interaction has been watched, and not just once.
+    for variant in VARIANTS {
+        let count = seen.get(variant).copied().unwrap_or(0);
+        assert!(count >= 20, "`{variant}` fired {count} times");
+    }
+    assert_eq!(seen.len(), VARIANTS.len(), "an interaction nobody listed");
+}
+
+#[test]
+fn how_a_reduction_is_driven_makes_no_difference() {
+    let mut random = Random(seed(0xD21FE));
+    let mut sample: Vec<Term> = closed_terms(7).collect();
+    for round in 0..800 {
+        let shape = Shape {
+            redexes: [2, 5, 9][round % 3],
+            free: [0, 3][round % 2],
+        };
+        let size = 10 + random.below(60);
+        sample.push(random.term(size, 0, shape));
+    }
+    sample.extend(["fact 3", "fib 7", "2 2 2 2 id id", "pred 5"].map(corpus_term));
+    let mut finished = 0;
+    for term in sample {
+        let machine = || Machine::new(&term).expect("the term has no unbound index");
+        let mut direct = machine();
+        let outcome = direct.normalize(200_000);
+
+        // One interaction at a time.
+        let mut stepped = machine();
+        let mut steps = 0;
+        while steps < direct.stats().interactions() && stepped.step().unwrap().is_some() {
+            steps += 1;
+        }
+        assert_eq!(stepped.stats(), direct.stats(), "{term}");
+        if outcome.is_ok() {
+            assert_eq!(stepped.step(), Ok(None), "{term}");
+            assert_eq!(stepped.readback(), outcome, "{term}");
+        }
+
+        // In batches of uneven size, some of which stop at a beta.
+        let mut batched = machine();
+        while batched.stats().interactions() < direct.stats().interactions() {
+            let left = direct.stats().interactions() - batched.stats().interactions();
+            let batch = 1 + random.below(40) as u64;
+            let fired = batched.advance(batch.min(left), random.below(3) == 0);
+            assert!(fired.unwrap().is_some(), "{term}");
+        }
+        assert_eq!(batched.stats(), direct.stats(), "{term}");
+
+        let Ok(normal) = outcome else {
+            continue;
+        };
+        finished += 1;
+        assert_eq!(batched.readback().as_ref(), Ok(&normal), "{term}");
+
+        // In slices of fuel, each taking up the walk where the last stopped.
+        let mut sliced = machine();
+        let slice = 1 + random.below(60) as u64;
+        let resumed = loop {
+            match sliced.normalize(slice) {
+                Err(Halt::OutOfFuel) => {}
+                outcome => break outcome,
+            }
+        };
+        assert_eq!(resumed.as_ref(), Ok(&normal), "{term}: slices of {slice}");
+        assert_eq!(sliced.stats(), direct.stats(), "{term}: slices of {slice}");
+
+        // With a collection after every interaction.
+        let mut collected = machine();
+        while let Some(rule) = collected.step().unwrap() {
+            collected.collect();
+            assert_eq!(collected.net().check(), Ok(()), "{term}: after {rule:?}");
+        }
+        assert_eq!(collected.readback().as_ref(), Ok(&normal), "{term}");
+        assert_eq!(collected.stats().beta, direct.stats().beta, "{term}");
+        assert_eq!(
+            collected.stats().interactions(),
+            direct.stats().interactions(),
+            "{term}"
+        );
+    }
+    assert!(finished > 800, "only {finished} terms have a normal form");
 }
 
 #[test]
 fn collecting_garbage_changes_nothing() {
-    with_deep_stack(check_collecting_garbage_changes_nothing);
-}
-
-fn check_collecting_garbage_changes_nothing() {
-    let mut random = Random(0xC0FFEE);
+    let mut random = Random(seed(0xC0FFEE));
     let mut sample: Vec<Term> = closed_terms(8).collect();
     for _ in 0..3_000 {
         let size = 10 + random.below(30);
-        sample.push(random.term(size, 0, 5));
+        let shape = Shape {
+            redexes: 5,
+            free: 0,
+        };
+        sample.push(random.term(size, 0, shape));
     }
     let mut removed = 0;
     for term in sample {
@@ -288,51 +547,34 @@ fn check_collecting_garbage_changes_nothing() {
     assert!(removed > 0, "no term left garbage behind");
 }
 
-/// Definitions shared by the corpus, in dependency order.
-const PRELUDE: [(&str, &str); 14] = [
-    ("id", r"\x. x"),
-    ("true", r"\a b. a"),
-    ("false", r"\a b. b"),
-    ("succ", r"\n f x. f (n f x)"),
-    ("plus", r"\m n f x. m f (n f x)"),
-    ("times", r"\m n f. m (n f)"),
-    ("iszero", r"\n. n (\x. false) true"),
-    ("pred", r"\n f x. n (\g h. h (g f)) (\u. x) (\u. u)"),
-    ("pair", r"\a b s. s a b"),
-    ("fst", r"\p. p true"),
-    ("snd", r"\p. p false"),
-    ("fix", r"\f. (\x. f (x x)) (\x. f (x x))"),
-    ("fact", r"fix (\r n. iszero n 1 (times n (r (pred n))))"),
-    (
-        "fib",
-        r"\n. fst (n (\p. pair (snd p) (plus (fst p) (snd p))) (pair 0 1))",
-    ),
-];
+/// The definitions of `examples/prelude.lam`, which the corpus is written
+/// with. Loading the file itself keeps it tested.
+fn prelude() -> Definitions {
+    let mut definitions = Definitions::new();
+    for (line, source) in statements(include_str!("../../../examples/prelude.lam")) {
+        match definitions.statement(source) {
+            Ok(Some(Statement::Define(name, term))) => {
+                assert!(
+                    term.free_names().is_empty(),
+                    "prelude line {line}: `{name}` has free variables"
+                );
+                definitions.define(name, term);
+            }
+            Ok(None) => {}
+            other => panic!("prelude line {line}: {other:?}"),
+        }
+    }
+    definitions
+}
 
 fn corpus_term(source: &str) -> Term {
-    let mut definitions: Vec<(&str, Term)> = Vec::new();
-    let parse = |source: &str, definitions: &[(&str, Term)]| {
-        let lookup = |name: &str| {
-            definitions
-                .iter()
-                .find(|(defined, _)| *defined == name)
-                .map(|(_, term)| term.clone())
-        };
-        parse_with(source, &lookup).unwrap_or_else(|error| panic!("{source}: {error}"))
-    };
-    for (name, body) in PRELUDE {
-        let term = parse(body, &definitions);
-        definitions.push((name, term));
-    }
-    parse(source, &definitions)
+    prelude()
+        .parse(source)
+        .unwrap_or_else(|error| panic!("{source}: {error}"))
 }
 
 #[test]
 fn classic_examples_agree_with_the_reference() {
-    with_deep_stack(check_classic_examples_agree_with_the_reference);
-}
-
-fn check_classic_examples_agree_with_the_reference() {
     let mut tally = Tally::default();
     for source in [
         // From the Lambdascope reference implementation.
@@ -353,10 +595,17 @@ fn check_classic_examples_agree_with_the_reference() {
         r"3 3",
         r"plus 2 3",
         r"times 3 4",
+        r"power 2 5",
+        r"power 3 0",
+        r"minus 5 3",
         r"pred 5",
         r"iszero 0 a b",
         r"iszero 2 a b",
+        r"and true (not false) a b",
+        r"or false false a b",
+        r"compose succ (const 2) 7",
         r"fib 7",
+        r"fib 12",
         // Recursion through a fixed-point combinator.
         r"fact 3",
         r"fact 4",
@@ -365,14 +614,31 @@ fn check_classic_examples_agree_with_the_reference() {
         assert_eq!(tally.skipped, 0, "{source} did not normalize");
     }
     tally.report("classic examples");
+    // Some of these are large enough for the machine to collect garbage in
+    // the middle of its walk, which the small terms never make it do.
+    assert!(tally.collected > 0, "no garbage was collected on the way");
+}
+
+#[test]
+fn divergence_costs_no_more_than_the_fuel() {
+    // Terms without a normal form whose result, as far as it gets, takes an
+    // ever longer way to read. The fuel must bound the walk as well as the
+    // interactions, or these run until memory is gone.
+    for source in [
+        r"fix f",
+        r"fix succ",
+        r"\x. (\a. a a) (\a. (\b. x) (\b. a) (a a))",
+        r"fix (\self n. plus n (self (pred n))) 3",
+        r"(\x. x x x) (\x. x x x)",
+    ] {
+        let mut machine = Machine::new(&corpus_term(source)).unwrap();
+        assert_eq!(machine.normalize(200_000), Err(Halt::OutOfFuel), "{source}");
+        assert_eq!(machine.net().check(), Ok(()), "{source}");
+    }
 }
 
 #[test]
 fn optimal_sharing_beats_normal_order() {
-    with_deep_stack(check_optimal_sharing_beats_normal_order);
-}
-
-fn check_optimal_sharing_beats_normal_order() {
     // Each of the `n` nested applications of `2` doubles the work of normal
     // order, but all the copies it makes fall in the same families.
     let term = corpus_term(r"2 2 2 2 id id");
