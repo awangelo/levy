@@ -17,7 +17,10 @@
         <label for="examples">Example</label>
         <select id="examples"></select>
         <label for="script">Script</label>
-        <textarea id="script" spellcheck="false" autocomplete="off"></textarea>
+        <div class="editor">
+          <pre id="script-colors" aria-hidden="true"></pre>
+          <textarea id="script" spellcheck="false" autocomplete="off"></textarea>
+        </div>
         <p class="hint">
           One statement per line: <code>name = term</code> defines, a bare term is reduced.
           Write <code>\x. body</code> or <code>λx. body</code>; numbers are Church numerals.

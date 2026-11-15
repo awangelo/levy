@@ -42,6 +42,7 @@ const $ = (id) => document.getElementById(id);
 const ui = {
   examples: $("examples"),
   script: $("script"),
+  scriptColors: $("script-colors"),
   load: $("load"),
   problem: $("problem"),
   reset: $("reset"),
@@ -84,6 +85,56 @@ function svg(name, attributes, parent) {
   for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, value);
   parent?.append(element);
   return element;
+}
+
+// ---------------------------------------------------------------- colors
+
+// The tokens of the language, as the parser reads them. A name never holds
+// a λ, which always starts an abstraction.
+const TOKEN = /(--[^\n]*)|([λ\\])|(\d+)|((?:(?!λ)[\p{L}_])(?:(?!λ)[\p{L}\p{N}_'])*)|(=)|([().])|(\s+|.)/gu;
+const DEFINES = /[ \t]*=/y;
+
+function span(kind, text) {
+  return Object.assign(document.createElement("span"), { className: `t-${kind}`, textContent: text });
+}
+
+// Fills `element` with `text`, each token in a span classed for its color.
+function colorize(element, text) {
+  const parts = [];
+  let plain = "";
+  const add = (kind, token) => {
+    if (plain) parts.push(plain);
+    plain = "";
+    parts.push(span(kind, token));
+  };
+  for (const match of text.matchAll(TOKEN)) {
+    const [token, comment, lambda, number, name, equals, punctuation] = match;
+    const end = match.index + token.length;
+    if (comment) add("comment", token);
+    else if (lambda) add("keyword", token);
+    else if (number) add("number", token);
+    else if (name && (match.index === 0 || text[match.index - 1] === "\n") && defines(text, end)) {
+      // The name a definition defines starts its line.
+      add("definition", token);
+    } else if (equals) add("operator", token);
+    else if (punctuation) add("punctuation", token);
+    else plain += token;
+  }
+  if (plain) parts.push(plain);
+  element.replaceChildren(...parts);
+}
+
+function defines(text, at) {
+  DEFINES.lastIndex = at;
+  return DEFINES.test(text);
+}
+
+// Shows the colors of the script under its transparent text.
+function paintScript() {
+  const text = ui.script.value;
+  // A last empty line needs something in it to take up its height.
+  colorize(ui.scriptColors, text.endsWith("\n") ? `${text} ` : text);
+  ui.scriptColors.scrollTop = ui.script.scrollTop;
 }
 
 // ---------------------------------------------------------------- drawing
@@ -384,7 +435,9 @@ function fit() {
 }
 
 function readout() {
-  ui.term.textContent = frame.term;
+  // A term too large to show comes as a note in angle brackets.
+  if (frame.term.startsWith("<")) ui.term.replaceChildren(span("comment", frame.term));
+  else colorize(ui.term, frame.term);
   const stats = frame.stats;
   ui.statBeta.textContent = stats.beta;
   ui.statBookkeeping.textContent = stats.annihilations + stats.commutations + stats.dissolutions;
@@ -604,6 +657,7 @@ ui.net.addEventListener("pointercancel", release);
 
 ui.examples.addEventListener("change", () => {
   ui.script.value = EXAMPLES[Number(ui.examples.value)][1];
+  paintScript();
   // The arrow keys go back to stepping, not to the list of examples.
   ui.examples.blur();
   load();
@@ -635,9 +689,12 @@ document.addEventListener("keydown", (event) => {
 ui.script.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) load();
 });
+ui.script.addEventListener("input", paintScript);
+ui.script.addEventListener("scroll", () => (ui.scriptColors.scrollTop = ui.script.scrollTop));
 
 EXAMPLES.forEach(([name], index) => ui.examples.append(new Option(name, String(index))));
 ui.script.value = EXAMPLES[0][1];
+paintScript();
 idle();
 
 try {

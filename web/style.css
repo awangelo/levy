@@ -1,35 +1,41 @@
+/* The colors of Zed's "macOS Classic Light" theme, with its syntax colors
+   overridden, and the Monaco font. */
 :root {
-  color-scheme: light dark;
-  --bg: #f6f5f1;
-  --panel: #ffffff;
-  --ink: #1d1d1f;
-  --muted: #6b6b70;
-  --line: #d9d7cf;
-  --wire: #8b8b92;
-  --lam: #2f6fde;
-  --app: #3a3a40;
-  --fan: #d9730d;
-  --delim: #0f9d7a;
-  --accent: #d6336c;
-  --on-lam: #ffffff;
-  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
-}
+  color-scheme: light;
+  --page: #f9f9f9;
+  --editor: #ffffff;
+  --line: #d2d2d2;
+  --line-soft: #e0e0e0;
+  --ink: #040403;
+  --muted: #505050;
+  --faint: #929292;
+  --accent: #1f6ae2;
+  --selection: #3b9ee53d;
+  --element: #f0f0f0;
+  --element-hover: #e0e0e0;
+  --element-active: #d0d0d0;
+  --error: #bf4133;
+  --error-background: #fbeae5;
+  --error-border: #ec9f89;
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #17181b;
-    --panel: #1f2125;
-    --ink: #ececee;
-    --muted: #9a9aa2;
-    --line: #34363c;
-    --wire: #7d7f88;
-    --lam: #6ea0ff;
-    --app: #c9c9d0;
-    --fan: #f2994a;
-    --delim: #3fcfa6;
-    --accent: #ff6b9a;
-    --on-lam: #10131a;
-  }
+  /* Syntax colors, also used for the kinds of node. */
+  --keyword: #34589d;
+  --type: #b7612b;
+  --function: #5847b9;
+  --string: #5f803a;
+  --number: #bf4133;
+  --comment: #8c8982;
+  --operator: #5e5c55;
+  --punctuation: #716f69;
+
+  --lam: var(--keyword);
+  --app: var(--ink);
+  --fan: var(--type);
+  --delim: var(--string);
+  --wire: var(--comment);
+  --next: var(--function);
+
+  --mono: Monaco, "Monaco Nerd Font Mono", "Monaco Nerd Font", Menlo, monospace;
 }
 
 * {
@@ -41,11 +47,15 @@
   display: none !important;
 }
 
+::selection {
+  background: var(--selection);
+}
+
 body {
   margin: 0;
-  background: var(--bg);
+  background: var(--page);
   color: var(--ink);
-  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font: 13px/1.5 var(--mono);
 }
 
 header {
@@ -53,13 +63,15 @@ header {
   align-items: baseline;
   gap: 16px;
   flex-wrap: wrap;
-  padding: 14px 16px 6px;
+  padding: 10px 16px;
+  background: var(--editor);
+  border-bottom: 1px solid var(--line);
 }
 
 header h1 {
   margin: 0;
-  font: 600 22px/1 var(--mono);
-  letter-spacing: -0.02em;
+  font: 18px/1 var(--mono);
+  color: var(--keyword);
 }
 
 header p {
@@ -69,9 +81,9 @@ header p {
 
 main {
   display: grid;
-  grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
-  gap: 16px;
-  padding: 10px 16px 24px;
+  grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px 16px 24px;
 }
 
 @media (max-width: 860px) {
@@ -81,10 +93,10 @@ main {
 }
 
 section {
-  background: var(--panel);
+  background: var(--editor);
   border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 14px;
+  border-radius: 6px;
+  padding: 12px;
 }
 
 .source {
@@ -98,9 +110,7 @@ label,
 h2 {
   margin: 0;
   font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  font-weight: normal;
   color: var(--muted);
 }
 
@@ -109,41 +119,88 @@ textarea,
 button {
   font: inherit;
   color: inherit;
-  background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 7px;
+  border-radius: 4px;
 }
 
 select {
-  padding: 6px 8px;
+  padding: 4px 6px;
+  background: var(--editor);
 }
 
-textarea {
-  min-height: 220px;
-  padding: 10px;
-  resize: vertical;
+select:focus-visible,
+textarea:focus-visible,
+button:focus-visible,
+input:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* The script is a transparent textarea over a copy of its text that shows
+   the syntax colors. Both must lay the text out exactly alike. */
+.editor {
+  position: relative;
+}
+
+.editor textarea,
+.editor pre {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
   font: 13px/1.5 var(--mono);
+  letter-spacing: 0;
   tab-size: 2;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  scrollbar-gutter: stable;
+}
+
+.editor textarea {
+  position: relative;
+  min-height: 240px;
+  resize: vertical;
+  overflow-y: auto;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--ink);
+}
+
+.editor pre {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  border-color: transparent;
+  background: var(--editor);
+  color: var(--ink);
+  pointer-events: none;
 }
 
 .hint {
   margin: 0;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--muted);
 }
 
 code {
   font-family: var(--mono);
-  font-size: 0.92em;
+  color: var(--ink);
 }
 
 button {
-  padding: 6px 12px;
+  padding: 4px 10px;
+  background: var(--element);
   cursor: pointer;
 }
 
 button:hover:not(:disabled) {
-  border-color: var(--muted);
+  background: var(--element-hover);
+}
+
+button:active:not(:disabled) {
+  background: var(--element-active);
 }
 
 button:disabled {
@@ -152,18 +209,27 @@ button:disabled {
 }
 
 button.primary {
-  background: var(--lam);
-  border-color: var(--lam);
-  color: var(--on-lam);
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+}
+
+button.primary:hover:not(:disabled),
+button.primary:active:not(:disabled) {
+  background: #1a5ac2;
+}
+
+input[type="range"] {
+  accent-color: var(--accent);
 }
 
 .problem {
   margin: 0;
-  padding: 8px 10px;
-  border-radius: 7px;
-  border: 1px solid var(--accent);
-  color: var(--accent);
-  font: 13px/1.4 var(--mono);
+  padding: 6px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--error-border);
+  background: var(--error-background);
+  color: var(--error);
   white-space: pre-wrap;
 }
 
@@ -178,7 +244,7 @@ button.primary {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .speed {
@@ -192,9 +258,9 @@ button.primary {
   position: relative;
   height: min(62vh, 640px);
   min-height: 320px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--bg);
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  background: var(--editor);
   overflow: hidden;
 }
 
@@ -224,7 +290,7 @@ button.primary {
 .wire {
   fill: none;
   stroke: var(--wire);
-  stroke-width: 1.6;
+  stroke-width: 1.4;
 }
 
 .wire.back {
@@ -233,25 +299,25 @@ button.primary {
 }
 
 .wire.next {
-  stroke: var(--accent);
-  stroke-width: 3.2;
+  stroke: var(--next);
+  stroke-width: 3;
 }
 
 .port {
-  fill: var(--wire);
+  fill: var(--punctuation);
 }
 
 .port.next {
-  fill: var(--accent);
+  fill: var(--next);
 }
 
 .node .shape {
-  fill: var(--panel);
-  stroke-width: 2;
+  fill: var(--editor);
+  stroke-width: 1.8;
 }
 
 .node text {
-  font: 600 13px/1 var(--mono);
+  font: 13px/1 var(--mono);
   fill: var(--ink);
   text-anchor: middle;
   dominant-baseline: central;
@@ -260,6 +326,10 @@ button.primary {
 
 .node.lam .shape {
   stroke: var(--lam);
+}
+
+.node.lam text {
+  fill: var(--lam);
 }
 
 .node.app .shape {
@@ -279,9 +349,16 @@ button.primary {
   font-size: 11px;
 }
 
+.node.fan text {
+  fill: var(--fan);
+}
+
+.node.delim text {
+  fill: var(--delim);
+}
+
 .node.delim text.height {
   font-size: 10px;
-  fill: var(--delim);
   text-anchor: start;
 }
 
@@ -301,8 +378,8 @@ button.primary {
 }
 
 .node.next .shape {
-  stroke: var(--accent);
-  stroke-width: 3.2;
+  stroke: var(--next);
+  stroke-width: 3;
 }
 
 .readout {
@@ -324,7 +401,7 @@ button.primary {
   overflow: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font: 14px/1.5 var(--mono);
+  font: 13px/1.5 var(--mono);
 }
 
 .readout p {
@@ -332,7 +409,8 @@ button.primary {
 }
 
 .next strong {
-  color: var(--accent);
+  font-weight: normal;
+  color: var(--next);
 }
 
 .stats {
@@ -349,7 +427,8 @@ button.primary {
 
 .stats dd {
   margin: 0;
-  font: 600 18px/1.2 var(--mono);
+  font: 16px/1.2 var(--mono);
+  color: var(--number);
   font-variant-numeric: tabular-nums;
 }
 
@@ -360,7 +439,7 @@ button.primary {
   margin: 0;
   padding: 0;
   list-style: none;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--muted);
 }
 
@@ -399,5 +478,30 @@ button.primary {
   width: 7px;
   height: 7px;
   border: none;
-  background: var(--wire);
+  background: var(--punctuation);
+}
+
+/* Tokens of a script or a term, colored as the editor colors code. */
+.t-keyword {
+  color: var(--keyword);
+}
+
+.t-definition {
+  color: var(--function);
+}
+
+.t-number {
+  color: var(--number);
+}
+
+.t-comment {
+  color: var(--comment);
+}
+
+.t-operator {
+  color: var(--operator);
+}
+
+.t-punctuation {
+  color: var(--punctuation);
 }
