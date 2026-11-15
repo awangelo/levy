@@ -102,6 +102,9 @@ const GROWTH_BEFORE_COLLECTION: usize = 4;
 const SMALLEST_COLLECTION: usize = 4_096;
 
 /// A net under reduction.
+///
+/// A machine stays on the thread it was made on: the walk it keeps between
+/// calls counts its references without locking, which is a sixth faster.
 #[derive(Clone, Debug)]
 pub struct Machine {
     net: Net,
