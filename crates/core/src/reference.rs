@@ -47,8 +47,20 @@ impl std::error::Error for BudgetExhausted {}
 /// node copied by a substitution. That bounds the memory as well, and since
 /// nothing here recurses on the shape of a term, the stack is no limit.
 pub fn normalize(term: &Term, budget: u64) -> Result<Outcome, BudgetExhausted> {
+    normalize_unless(term, budget, &|| false)
+}
+
+/// Like [`normalize`], but asks `interrupted` every thousand units or so
+/// whether to give up, and gives up as if the budget had run out once it
+/// says yes.
+pub fn normalize_unless(
+    term: &Term,
+    budget: u64,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<Outcome, BudgetExhausted> {
     let mut reducer = Reducer {
         budget,
+        interrupted,
         beta_steps: 0,
         degrees: HashSet::new(),
     };
@@ -303,15 +315,19 @@ impl Labelled {
     }
 }
 
-struct Reducer {
+struct Reducer<'a> {
     budget: u64,
+    interrupted: &'a dyn Fn() -> bool,
     beta_steps: u64,
     degrees: HashSet<Label>,
 }
 
-impl Reducer {
+impl Reducer<'_> {
     fn spend(&mut self) -> Result<(), BudgetExhausted> {
         self.budget = self.budget.checked_sub(1).ok_or(BudgetExhausted)?;
+        if self.budget.is_multiple_of(1 << 10) && (self.interrupted)() {
+            return Err(BudgetExhausted);
+        }
         Ok(())
     }
 
@@ -518,6 +534,13 @@ mod tests {
         );
         let outcome = normalize(&term, 1_000).unwrap();
         assert_eq!(outcome.normal_form, Term::lam("y", Term::Var(usize::MAX)));
+    }
+
+    #[test]
+    fn gives_up_when_interrupted() {
+        let omega = parse(r"(\x. x x) (\x. x x)").unwrap();
+        let outcome = normalize_unless(&omega, u64::MAX, &|| true);
+        assert_eq!(outcome.unwrap_err(), BudgetExhausted);
     }
 
     #[test]
