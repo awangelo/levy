@@ -11,6 +11,7 @@
   --fan: #d9730d;
   --delim: #0f9d7a;
   --accent: #d6336c;
+  --on-lam: #ffffff;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 }
 
@@ -27,11 +28,17 @@
     --fan: #f2994a;
     --delim: #3fcfa6;
     --accent: #ff6b9a;
+    --on-lam: #10131a;
   }
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* An element that sets its own `display` would otherwise show while hidden. */
+[hidden] {
+  display: none !important;
 }
 
 body {
@@ -147,7 +154,7 @@ button:disabled {
 button.primary {
   background: var(--lam);
   border-color: var(--lam);
-  color: #fff;
+  color: var(--on-lam);
 }
 
 .problem {

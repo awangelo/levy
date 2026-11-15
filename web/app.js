@@ -1,14 +1,12 @@
 // The page: it hands scripts to the WebAssembly stepper and draws the frames
 // that come back. All of the reduction logic lives on the Rust side.
 
-import init, { Session } from "./pkg/levy_web.js";
-
 const SVG = "http://www.w3.org/2000/svg";
 const COLUMN = 62; // horizontal distance between neighbouring leaves
 const ROW = 58; // vertical distance between a node and its children
 const MARGIN = 44;
 const MAX_DRAWN = 700; // nets with more nodes are not drawn
-const MAX_BATCH = 50_000; // steps "Next β" and "Finish" fire before giving up
+const SLICE = 12; // milliseconds a run works before it lets the page breathe
 
 const RADIUS = { root: 4, lam: 15, app: 15, fan: 15, delim: 13, eraser: 8, free: 14 };
 
@@ -66,14 +64,20 @@ const ui = {
   statCollected: $("stat-collected"),
 };
 
+let Session = null; // the class of the stepper, once the package is loaded
+let restarts = 0; // how many times the package had to be loaded again
 let session = null;
 let frame = null; // the frame on screen
 let drawn = { nodes: [], wires: [] }; // its SVG elements
 let positions = new Map(); // node id -> where it is drawn right now
 let view = null; // the viewBox right now
+let home = null; // the viewBox that shows the whole net
 let following = true; // whether the view keeps the whole net in sight
 let animation = 0; // identifies the running animation; bumping it cancels
-let timer = null; // set while playing
+let timer = null; // set while playing or running
+let run = null; // the button that started the run under way, and its label
+
+const calm = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 function svg(name, attributes, parent) {
   const element = document.createElementNS(SVG, name);
@@ -246,10 +250,10 @@ function draw(next, animate, spawn) {
   ui.nodes.replaceChildren();
   drawn = { nodes: [], wires: [] };
 
-  const oversize = next.nodes.length > MAX_DRAWN;
+  const oversize = next.size > MAX_DRAWN;
   ui.oversize.hidden = !oversize;
   ui.oversize.textContent = oversize
-    ? `The net has ${next.nodes.length} nodes, too many to draw. Stepping still works.`
+    ? `The net has ${next.size} nodes, too many to draw. Stepping still works.`
     : "";
   if (oversize) {
     animation += 1;
@@ -272,11 +276,12 @@ function draw(next, animate, spawn) {
   const starts = new Map();
   for (const [id, target] of targets) starts.set(id, positions.get(id) ?? spawn ?? target);
   // Once the reader has zoomed or panned, the view stays where they put it.
-  const viewTarget = following || !view ? boundsOf(targets.values()) : view;
+  home = boundsOf(targets.values());
+  const viewTarget = following || !view ? home : view;
   const viewStart = view ?? viewTarget;
 
   const token = ++animation;
-  const length = animate ? duration() : 0;
+  const length = animate && !calm.matches ? duration() : 0;
   const began = performance.now();
   const tick = (now) => {
     if (token !== animation) return;
@@ -308,42 +313,69 @@ function applyView() {
   ui.net.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
 }
 
-// Zooms around the pointer: the point under it stays where it is.
-function zoom(event) {
+// Zooms around a point of the screen: what is under it stays where it is.
+function zoomAt(clientX, clientY, factor) {
   if (!view) return;
-  event.preventDefault();
-  const pointer = new DOMPoint(event.clientX, event.clientY).matrixTransform(ui.net.getScreenCTM().inverse());
-  const factor = Math.exp(event.deltaY * 0.0015);
+  // From a few nodes across to a few times the whole net: beyond that there
+  // is nothing to see, and the numbers of the viewBox run away.
+  const widest = Math.max(home ? home.w * 8 : view.w, 4 * COLUMN);
+  const width = Math.min(Math.max(view.w * factor, 2 * COLUMN), widest);
+  const scale = width / view.w;
+  const point = new DOMPoint(clientX, clientY).matrixTransform(ui.net.getScreenCTM().inverse());
   following = false;
   view = {
-    x: pointer.x - (pointer.x - view.x) * factor,
-    y: pointer.y - (pointer.y - view.y) * factor,
-    w: view.w * factor,
-    h: view.h * factor,
+    x: point.x - (point.x - view.x) * scale,
+    y: point.y - (point.y - view.y) * scale,
+    w: view.w * scale,
+    h: view.h * scale,
   };
   applyView();
 }
 
-let dragged = null; // where the pointer was, while it drags the net
-
-function pan(event) {
-  if (!dragged || !view) return;
+function panBy(dx, dy) {
+  if (!view) return;
   // The net is scaled to fit the canvas in both directions, so one screen
   // pixel is this many units of the viewBox.
   const scale = Math.max(view.w / ui.net.clientWidth, view.h / ui.net.clientHeight);
   following = false;
-  view = {
-    ...view,
-    x: view.x - (event.clientX - dragged.x) * scale,
-    y: view.y - (event.clientY - dragged.y) * scale,
-  };
-  dragged = { x: event.clientX, y: event.clientY };
+  view = { ...view, x: view.x - dx * scale, y: view.y - dy * scale };
   applyView();
 }
 
-function release() {
-  dragged = null;
-  ui.net.classList.remove("dragging");
+const pointers = new Map(); // where each pointer that is down on the net was
+let pinch = null; // how far apart two of them were, and the point between
+
+function press(event) {
+  if (event.pointerType === "mouse" && event.button !== 0) return;
+  pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  pinch = null;
+  ui.net.setPointerCapture(event.pointerId);
+  ui.net.classList.add("dragging");
+}
+
+function drag(event) {
+  const last = pointers.get(event.pointerId);
+  if (!last) return;
+  // A button let go outside the window never says so.
+  if (event.pointerType === "mouse" && event.buttons === 0) return release(event);
+  const here = { x: event.clientX, y: event.clientY };
+  pointers.set(event.pointerId, here);
+  if (pointers.size === 1) return panBy(here.x - last.x, here.y - last.y);
+  if (pointers.size !== 2) return;
+  // Two fingers: the point between them drags, their distance zooms.
+  const [a, b] = [...pointers.values()];
+  const now = { span: Math.hypot(a.x - b.x, a.y - b.y), x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  if (pinch) {
+    panBy(now.x - pinch.x, now.y - pinch.y);
+    if (now.span > 0 && pinch.span > 0) zoomAt(now.x, now.y, pinch.span / now.span);
+  }
+  pinch = now;
+}
+
+function release(event) {
+  pointers.delete(event.pointerId);
+  pinch = null;
+  if (pointers.size === 0) ui.net.classList.remove("dragging");
 }
 
 function fit() {
@@ -356,7 +388,7 @@ function readout() {
   const stats = frame.stats;
   ui.statBeta.textContent = stats.beta;
   ui.statBookkeeping.textContent = stats.annihilations + stats.commutations + stats.dissolutions;
-  ui.statNodes.textContent = frame.nodes.length;
+  ui.statNodes.textContent = frame.size;
   ui.statCollected.textContent = stats.collected;
   if (frame.error) {
     ui.next.textContent = `Internal error: ${frame.error}`;
@@ -369,7 +401,8 @@ function readout() {
   const done = !frame.next;
   for (const button of [ui.step, ui.beta, ui.play, ui.finish]) button.disabled = done;
   ui.back.disabled = !frame.can_go_back;
-  ui.reset.disabled = !frame.can_go_back;
+  // The start can always be gone back to, even when the steps cannot.
+  ui.reset.disabled = frame.step === 0;
 }
 
 // ---------------------------------------------------------------- control
@@ -379,8 +412,66 @@ function problem(message) {
   ui.problem.textContent = message ?? "";
 }
 
+// Loads the WebAssembly package. Every call gives a fresh instance with a
+// memory of its own, which is how the page gets over one that broke down.
+async function boot() {
+  const again = restarts ? `?restart=${restarts}` : "";
+  const module = await import(`./pkg/levy_web.js${again}`);
+  await module.default();
+  Session = module.Session;
+}
+
+const FAILED = Symbol("failed");
+
+// A trap inside WebAssembly, which is what running out of memory looks like,
+// leaves the instance unusable: its objects stay locked for good.
+function isBreakdown(error) {
+  const text = String(error?.message ?? error);
+  return (
+    error instanceof WebAssembly.RuntimeError ||
+    error instanceof RangeError ||
+    /unreachable|out of memory|null pointer passed to rust|recursive use of an object/i.test(text)
+  );
+}
+
+// Nothing can be stepped until a script is loaded again.
+function idle() {
+  for (const button of [ui.reset, ui.back, ui.step, ui.beta, ui.play, ui.finish]) button.disabled = true;
+}
+
+async function recover(error) {
+  stop();
+  session = null;
+  Session = null;
+  frame = null;
+  restarts += 1;
+  idle();
+  const what = `The reducer broke down on this term, most likely for lack of memory (${error?.message ?? error}).`;
+  problem(`${what} Restarting it…`);
+  try {
+    await boot();
+    problem(`${what} It was restarted: load another script to go on.`);
+  } catch (failure) {
+    problem(`${what} It could not be restarted: reload the page.\n${failure}`);
+  }
+}
+
+// Calls into the stepper. If the call fails, says why and returns FAILED.
+function attempt(call) {
+  try {
+    return call();
+  } catch (error) {
+    if (isBreakdown(error)) recover(error);
+    else problem(String(error?.message ?? error));
+    return FAILED;
+  }
+}
+
 function show(animate, spawn) {
-  draw(JSON.parse(session.frame()), animate, spawn);
+  if (!session) return;
+  const json = attempt(() => session.frame(MAX_DRAWN));
+  if (json === FAILED) return;
+  draw(JSON.parse(json), animate, spawn);
   readout();
 }
 
@@ -393,51 +484,80 @@ function spawnPoint() {
   return { x: (upper.x + lower.x) / 2, y: (upper.y + lower.y) / 2 };
 }
 
-// Fires steps while `more` allows it and returns the rule fired last.
-function advance(more) {
+// Fires one interaction and returns its rule, or null if there was none.
+function step() {
   if (!session || !frame?.next) return null;
   const spawn = spawnPoint();
-  let rule = null;
-  let fired = 0;
-  try {
-    do {
-      rule = session.step() ?? null;
-      fired += 1;
-    } while (rule && fired < MAX_BATCH && more(rule));
-  } catch (error) {
-    problem(String(error.message ?? error));
-  }
+  const rule = attempt(() => session.step() ?? null);
+  if (rule === FAILED) return null;
   show(true, spawn);
   return rule;
 }
 
+// Ends whatever is playing or running.
 function stop() {
   clearTimeout(timer);
   timer = null;
   ui.play.textContent = "Play";
+  if (!run) return;
+  // A run draws nothing until it ends, so the screen is behind.
+  run.button.textContent = run.label;
+  run = null;
+  show(false, null);
 }
 
 function play() {
   if (timer !== null) return stop();
   ui.play.textContent = "Pause";
   const turn = () => {
-    const rule = advance(() => false);
-    if (rule && frame.next) timer = setTimeout(turn, duration() + 60);
+    const rule = step();
+    if (rule && frame?.next) timer = setTimeout(turn, duration() + 60);
     else stop();
+  };
+  timer = setTimeout(turn, 0);
+}
+
+// Runs to the normal form, or to the next β-step, in slices of a few
+// milliseconds so that the page stays alive and the run can be stopped.
+function runFrom(button, untilBeta) {
+  const running = run?.button === button;
+  stop();
+  if (running || !session || !frame?.next) return;
+  const spawn = spawnPoint();
+  run = { button, label: button.textContent };
+  button.textContent = "Stop";
+  let interactions = 64; // per slice, adjusted to what the net allows
+  const turn = () => {
+    const began = performance.now();
+    const rule = attempt(() => session.run(interactions, untilBeta) ?? null);
+    if (rule === FAILED) return;
+    if (rule === null || (untilBeta && rule === "beta")) {
+      run.button.textContent = run.label;
+      run = null;
+      timer = null;
+      return show(true, spawn);
+    }
+    const took = performance.now() - began;
+    if (took < SLICE / 2) interactions = Math.min(interactions * 2, 1 << 24);
+    else if (took > SLICE * 2) interactions = Math.max(1, interactions >> 1);
+    ui.next.textContent = `Running: ${session.steps()} interactions so far.`;
+    timer = setTimeout(turn, 0);
   };
   timer = setTimeout(turn, 0);
 }
 
 function load() {
   stop();
+  if (!Session) return;
+  const loaded = attempt(() => new Session(ui.script.value));
+  if (loaded === FAILED) return;
+  // The old session goes only now that the new one is there.
   try {
-    const loaded = new Session(ui.script.value);
     session?.free();
-    session = loaded;
-  } catch (error) {
-    problem(String(error.message ?? error));
-    return;
+  } catch {
+    // It is lost either way.
   }
+  session = loaded;
   problem(null);
   positions = new Map();
   view = null;
@@ -447,50 +567,69 @@ function load() {
 
 function back() {
   stop();
-  if (session?.back()) show(true, null);
+  if (!session) return;
+  const undone = attempt(() => session.back());
+  if (undone === true) show(true, null);
 }
 
 function reset() {
   stop();
   if (!session) return;
-  session.reset();
-  show(true, null);
+  if (attempt(() => session.reset()) !== FAILED) show(true, null);
 }
 
 ui.load.addEventListener("click", load);
-ui.step.addEventListener("click", () => (stop(), advance(() => false)));
-ui.beta.addEventListener("click", () => (stop(), advance((rule) => rule !== "beta")));
-ui.finish.addEventListener("click", () => (stop(), advance(() => true)));
+ui.step.addEventListener("click", () => (stop(), step()));
+ui.beta.addEventListener("click", () => runFrom(ui.beta, true));
+ui.finish.addEventListener("click", () => runFrom(ui.finish, false));
 ui.play.addEventListener("click", play);
 ui.back.addEventListener("click", back);
 ui.reset.addEventListener("click", reset);
 ui.fit.addEventListener("click", fit);
 
-ui.net.addEventListener("wheel", zoom, { passive: false });
-ui.net.addEventListener("pointerdown", (event) => {
-  dragged = { x: event.clientX, y: event.clientY };
-  ui.net.setPointerCapture(event.pointerId);
-  ui.net.classList.add("dragging");
+// A button pressed with the mouse should not keep the keyboard: space would
+// press it again instead of playing. Pressed from the keyboard, it keeps it.
+document.addEventListener("click", (event) => {
+  if (event.detail > 0) event.target.closest?.("button")?.blur();
 });
-ui.net.addEventListener("pointermove", pan);
+
+ui.net.addEventListener("wheel", (event) => {
+  event.preventDefault();
+  zoomAt(event.clientX, event.clientY, Math.exp(event.deltaY * 0.0015));
+}, { passive: false });
+ui.net.addEventListener("pointerdown", press);
+ui.net.addEventListener("pointermove", drag);
 ui.net.addEventListener("pointerup", release);
 ui.net.addEventListener("pointercancel", release);
 
 ui.examples.addEventListener("change", () => {
   ui.script.value = EXAMPLES[Number(ui.examples.value)][1];
+  // The arrow keys go back to stepping, not to the list of examples.
+  ui.examples.blur();
   load();
 });
+ui.speed.addEventListener("change", () => ui.speed.blur());
 
 document.addEventListener("keydown", (event) => {
+  // The shortcuts are plain keys. With a modifier, a key is the browser's.
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
   // Leave typing alone, and let space press whichever button has the focus.
   if (event.target.closest("textarea, select, input")) return;
-  if (event.key === " " && event.target.closest("button")) return;
-  const actions = { ArrowRight: () => ui.step.click(), ArrowLeft: back, " ": play, b: () => ui.beta.click(), f: fit };
-  const action = actions[event.key];
-  if (action) {
-    event.preventDefault();
-    action();
-  }
+  const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+  if (key === " " && event.target.closest("button")) return;
+  const actions = {
+    ArrowRight: () => ui.step.click(),
+    ArrowLeft: back,
+    " ": play,
+    b: () => ui.beta.click(),
+    f: fit,
+  };
+  const action = actions[key];
+  if (!action) return;
+  event.preventDefault();
+  // A key held down steps on and on, but toggles nothing.
+  if (event.repeat && !key.startsWith("Arrow")) return;
+  action();
 });
 
 ui.script.addEventListener("keydown", (event) => {
@@ -499,9 +638,10 @@ ui.script.addEventListener("keydown", (event) => {
 
 EXAMPLES.forEach(([name], index) => ui.examples.append(new Option(name, String(index))));
 ui.script.value = EXAMPLES[0][1];
+idle();
 
 try {
-  await init();
+  await boot();
   load();
 } catch (error) {
   problem(`The WebAssembly package did not load. Build it with scripts/build-web.sh.\n${error}`);

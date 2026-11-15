@@ -11,3 +11,11 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# The page has to download the WebAssembly package before it can do anything.
+# Optimizing across the crates as one unit makes it smaller without making it
+# slower, which optimizing for size would.
+[profile.web]
+inherits = "release"
+lto = true
+codegen-units = 1
