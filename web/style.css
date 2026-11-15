@@ -1,5 +1,3 @@
-/* The colors of Zed's "macOS Classic Light" theme, with its syntax colors
-   overridden, and the Monaco font. */
 :root {
   color-scheme: light;
   --page: #f9f9f9;
@@ -35,7 +33,7 @@
   --wire: var(--comment);
   --next: var(--function);
 
-  --mono: Monaco, "Monaco Nerd Font Mono", "Monaco Nerd Font", Menlo, monospace;
+  --mono: Monaco, Menlo, monospace;
 }
 
 * {
