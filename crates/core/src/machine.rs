@@ -29,9 +29,13 @@ use crate::translate::{UnboundIndex, translate};
 /// How many times each rule has fired.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
+    /// Beta interactions: the steps that count for optimality.
     pub beta: u64,
+    /// Pairs of fans or delimiters that cancelled each other.
     pub annihilations: u64,
+    /// Pairs that passed through each other.
     pub commutations: u64,
+    /// Delimiters that vanished at the root or at a free variable.
     pub dissolutions: u64,
     /// Nodes removed as garbage.
     pub collected: u64,
@@ -88,6 +92,7 @@ pub struct Redex {
     pub upper: NodeId,
     /// The node the walk runs into.
     pub lower: NodeId,
+    /// The rule that will rewrite the pair.
     pub rule: Rule,
 }
 

@@ -30,9 +30,13 @@ use crate::net::{Kind, Net, NodeId, Port, slot};
 /// The rule that applies to a pair of nodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Rule {
+    /// An application meets an abstraction.
     Beta,
+    /// Two fans or two delimiters of one level cancel each other.
     Annihilate,
+    /// Two nodes pass through each other, each copying the other.
     Commute,
+    /// A delimiter vanishes at the root or at a free variable.
     Dissolve,
 }
 

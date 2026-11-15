@@ -30,14 +30,17 @@ pub mod slot {
 pub struct NodeId(u32);
 
 impl NodeId {
+    /// The position of the node in the net's arena.
     pub fn index(self) -> usize {
         self.0 as usize
     }
 
+    /// The port of this node in the given slot.
     pub fn port(self, slot: u8) -> Port {
         Port { node: self, slot }
     }
 
+    /// The principal port of this node.
     pub fn principal(self) -> Port {
         self.port(slot::PRINCIPAL)
     }
@@ -46,11 +49,14 @@ impl NodeId {
 /// One port of one node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Port {
+    /// The node the port belongs to.
     pub node: NodeId,
+    /// Which port of the node it is: see [`slot`].
     pub slot: u8,
 }
 
 impl Port {
+    /// Whether this is the principal port of its node.
     pub fn is_principal(self) -> bool {
         self.slot == slot::PRINCIPAL
     }
@@ -66,21 +72,37 @@ pub enum Kind {
     /// The entry point of the net. Ports: the term.
     Root,
     /// An abstraction. Ports: parent, body, variable.
-    Lam { name: Symbol },
+    Lam {
+        /// The name of the variable, kept as a hint for printing.
+        name: Symbol,
+    },
     /// An application. Ports: function, result, argument.
     App,
     /// A fan, which shares what its principal port sees between two branches.
     /// Ports: shared side, first branch, second branch.
-    Fan { level: u32 },
+    Fan {
+        /// How many scopes the fan is inside of, counted from the scope of
+        /// what it shares.
+        level: u32,
+    },
     /// A delimiter, which marks the border of a scope. Ports: outside, inside.
     ///
     /// One node stands for `count` delimiters of the same level stacked on
     /// each other, that is, for the borders of that many nested scopes.
-    Delim { level: u32, count: u32 },
+    Delim {
+        /// How many scopes lie between the delimiter and the scope it
+        /// borders.
+        level: u32,
+        /// The height of the stack.
+        count: u32,
+    },
     /// A plug for a port nothing uses. Ports: the unused side.
     Eraser,
     /// A free variable. Ports: parent.
-    Free { name: Symbol },
+    Free {
+        /// The name of the variable.
+        name: Symbol,
+    },
 }
 
 impl Kind {
@@ -157,6 +179,7 @@ impl Net {
         net
     }
 
+    /// The node the term hangs from.
     pub fn root(&self) -> NodeId {
         self.root
     }
@@ -166,10 +189,12 @@ impl Net {
         self.cells.len() - self.vacant.len()
     }
 
+    /// Whether the net has no nodes. It never is: the root is always there.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// The symbol for `name`, the same one every time.
     pub fn intern(&mut self, name: &str) -> Symbol {
         if let Some(&symbol) = self.symbols.index.get(name) {
             return symbol;
@@ -181,6 +206,7 @@ impl Net {
         symbol
     }
 
+    /// The name a symbol of this net stands for.
     pub fn name(&self, symbol: Symbol) -> &str {
         &self.symbols.names[symbol.0 as usize]
     }
@@ -217,6 +243,7 @@ impl Net {
             .unwrap_or_else(|| panic!("node {id:?} is not in the net"))
     }
 
+    /// What the node is.
     pub fn kind(&self, id: NodeId) -> Kind {
         self.node(id).kind
     }
@@ -242,9 +269,18 @@ impl Net {
     }
 
     /// The port at the other end of the wire attached to `port`.
+    ///
+    /// Panics if the port is not linked, which it always is once a net is
+    /// built. Use [`wire`](Net::wire) on a net that may be half built.
     pub fn peer(&self, port: Port) -> Port {
-        self.node(port.node).links[usize::from(port.slot)]
+        self.wire(port)
             .unwrap_or_else(|| panic!("{port:?} is not linked"))
+    }
+
+    /// The port at the other end of the wire attached to `port`, if there is
+    /// a wire.
+    pub fn wire(&self, port: Port) -> Option<Port> {
+        self.node(port.node).links[usize::from(port.slot)]
     }
 
     /// Connects two ports with a wire, forgetting their previous wires.

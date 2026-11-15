@@ -21,12 +21,17 @@ pub fn to_dot(net: &Net) -> String {
             Kind::Eraser => "⊗".to_owned(),
             Kind::Free { name } => net.name(name).to_owned(),
         };
+        // Names come from the outside, and a quote in one would end the label.
+        let label = label.replace('\\', "\\\\").replace('"', "\\\"");
         writeln!(out, "  n{} [label=\"{label}\"];", id.index()).expect("writing to a string");
     }
     for (id, kind) in net.nodes() {
         for slot in 0..kind.ports() {
             let port = id.port(slot);
-            let peer = net.peer(port);
+            // A net still being built can have ports without a wire.
+            let Some(peer) = net.wire(port) else {
+                continue;
+            };
             if (peer.node, peer.slot) < (port.node, port.slot) {
                 continue;
             }
@@ -73,5 +78,15 @@ mod tests {
         // Total ports are 1 + 3 + 3 + 3 + 3 + 1 = 14, so there are 7 wires.
         assert_eq!(dot.matches(" -- ").count(), 7);
         assert!(dot.contains("λx"));
+    }
+
+    #[test]
+    fn odd_names_and_loose_ports_still_give_a_graph() {
+        assert_eq!(to_dot(&Net::new()).matches("[label=").count(), 1);
+        let mut net = Net::new();
+        let name = net.intern("a\"b\\");
+        let free = net.add(Kind::Free { name });
+        net.link(net.root().principal(), free.principal());
+        assert!(to_dot(&net).contains(r#"[label="a\"b\\"];"#));
     }
 }

@@ -11,24 +11,34 @@
 
 use crate::net::{Kind, Net, NodeId, Port};
 
-/// For each node index, whether a reading from the root can reach the node.
-pub fn reachable(net: &Net) -> Vec<bool> {
+/// For each node index and each port of the node, whether a reading from the
+/// root can come into the node by that port.
+pub fn entries(net: &Net) -> Vec<[bool; 3]> {
     let size = net.nodes().map(|(id, _)| id.index() + 1).max().unwrap_or(0);
-    // Per node, the ports by which a reading has already come in.
     let mut entered = vec![[false; 3]; size];
-    let mut reached = vec![false; size];
-    reached[net.root().index()] = true;
     let mut pending: Vec<Port> = vec![net.root().principal()];
     while let Some(exit) = pending.pop() {
-        let entry = net.peer(exit);
+        // A port without a wire, as in a net still being built, leads nowhere.
+        let Some(entry) = net.wire(exit) else {
+            continue;
+        };
         let node = entry.node;
-        reached[node.index()] = true;
         let seen = &mut entered[node.index()][usize::from(entry.slot)];
         if !std::mem::replace(seen, true) {
             let exits = net.kind(node).exits(entry.slot);
             pending.extend(exits.iter().map(|&slot| node.port(slot)));
         }
     }
+    entered
+}
+
+/// For each node index, whether a reading from the root can reach the node.
+pub fn reachable(net: &Net) -> Vec<bool> {
+    let mut reached: Vec<bool> = entries(net)
+        .iter()
+        .map(|ports| ports.contains(&true))
+        .collect();
+    reached[net.root().index()] = true;
     reached
 }
 
@@ -38,7 +48,9 @@ pub fn collect(net: &mut Net) -> usize {
     let reached = reachable(net);
     // An eraser is no part of any reading: it lives as long as what it plugs.
     let keeps = |net: &Net, id: NodeId| match net.kind(id) {
-        Kind::Eraser => reached[net.peer(id.principal()).node.index()],
+        Kind::Eraser => net
+            .wire(id.principal())
+            .is_some_and(|plugged| reached[plugged.node.index()]),
         _ => reached[id.index()],
     };
     let mut doomed = Vec::new();
@@ -49,7 +61,10 @@ pub fn collect(net: &mut Net) -> usize {
             continue;
         }
         for slot in 0..kind.ports() {
-            if !keeps(net, net.peer(id.port(slot)).node) {
+            if net
+                .wire(id.port(slot))
+                .is_some_and(|peer| !keeps(net, peer.node))
+            {
                 open.push(id.port(slot));
             }
         }
@@ -83,6 +98,14 @@ mod tests {
             assert_eq!(collect(&mut net), 0, "{source}");
             assert_eq!(net.check(), Ok(()), "{source}");
         }
+    }
+
+    #[test]
+    fn a_net_with_nothing_but_its_root_is_left_alone() {
+        let mut net = Net::new();
+        assert_eq!(reachable(&net), [true]);
+        assert_eq!(collect(&mut net), 0);
+        assert_eq!(net.len(), 1);
     }
 
     #[test]
