@@ -108,6 +108,20 @@ pub struct Machine {
     stats: Stats,
     /// The size at which `normalize` collects garbage next.
     collect_at: usize,
+    /// How far the reduction has got.
+    progress: Progress,
+}
+
+/// How far a reduction has got.
+#[derive(Clone, Debug)]
+enum Progress {
+    /// No walk is under way: the next one starts at the root.
+    Idle,
+    /// A walk stopped half way, to be taken up again.
+    Suspended(Suspended),
+    /// A walk has read the whole term and found nothing left to rewrite.
+    /// Nothing changes the net from here on, so this is for good.
+    Normal,
 }
 
 impl Machine {
@@ -117,6 +131,7 @@ impl Machine {
             net: translate(term)?,
             stats: Stats::default(),
             collect_at: SMALLEST_COLLECTION,
+            progress: Progress::Idle,
         })
     }
 
@@ -136,9 +151,8 @@ impl Machine {
     /// takes: every node of the net the walk comes to costs one unit, whether
     /// it is rewritten there or only passed. A normal form of `n` nodes
     /// therefore needs at least `n` units. When the fuel runs out the call
-    /// returns [`Halt::OutOfFuel`] and leaves the net as far as it got; a
-    /// later call takes up the reduction from there, reading again from the
-    /// root.
+    /// returns [`Halt::OutOfFuel`], and a later call takes up the reduction
+    /// where this one stopped.
     pub fn normalize(&mut self, fuel: u64) -> Result<Term, Halt> {
         self.normalize_unless(fuel, &|| false)
     }
@@ -151,13 +165,18 @@ impl Machine {
         fuel: u64,
         interrupted: &dyn Fn() -> bool,
     ) -> Result<Term, Halt> {
-        let mut reduce = Reduce {
-            machine: self,
-            interactions: u64::MAX,
-            until_beta: false,
-            last: None,
-        };
-        walk(&mut reduce, fuel, Some(interrupted))
+        if matches!(self.progress, Progress::Normal) {
+            // There is nothing left to rewrite, only the result to read.
+            let state = Suspended::at_root(&self.net);
+            let mut walker = Walker {
+                policy: &mut Observe(&self.net),
+                state,
+                fuel,
+                interrupted: Some(interrupted),
+            };
+            return walker.term();
+        }
+        self.reduce(u64::MAX, false, fuel, Some(interrupted)).0
     }
 
     /// Fires the next interaction of the reduction and reports its rule, or
@@ -166,33 +185,89 @@ impl Machine {
         self.advance(1, false)
     }
 
-    /// Fires up to `interactions` interactions in one walk, and with
-    /// `until_beta` stops after the first beta among them. Reports the rule
-    /// fired last, or `None` if the net was in normal form already.
+    /// Fires up to `interactions` interactions, and with `until_beta` stops
+    /// after the first beta among them. Reports the rule fired last, or
+    /// `None` if the net was in normal form already.
     ///
-    /// Every call reads the net from the root, so one call for many
-    /// interactions is much cheaper than many calls to [`step`](Machine::step).
+    /// The walk stops in front of the next pair and goes on from there in
+    /// the next call, so stepping costs no more than running.
     pub fn advance(&mut self, interactions: u64, until_beta: bool) -> Result<Option<Rule>, Halt> {
+        if matches!(self.progress, Progress::Normal) {
+            return Ok(None);
+        }
+        match self.reduce(interactions, until_beta, u64::MAX, None) {
+            (Ok(_) | Err(Halt::OutOfFuel), last) => Ok(last),
+            (Err(halt), _) => Err(halt),
+        }
+    }
+
+    /// Takes up the walk where it stopped, or starts one at the root, and
+    /// rewrites what it comes across within the limits given. Returns what
+    /// became of the walk, and the rule fired last.
+    fn reduce(
+        &mut self,
+        interactions: u64,
+        until_beta: bool,
+        fuel: u64,
+        interrupted: Option<&dyn Fn() -> bool>,
+    ) -> (Result<Term, Halt>, Option<Rule>) {
+        let state = match std::mem::replace(&mut self.progress, Progress::Idle) {
+            Progress::Suspended(state) => state,
+            Progress::Idle | Progress::Normal => Suspended::at_root(&self.net),
+        };
         let mut reduce = Reduce {
             machine: self,
             interactions,
             until_beta,
             last: None,
         };
-        match walk(&mut reduce, u64::MAX, None) {
-            Ok(_) | Err(Halt::OutOfFuel) => Ok(reduce.last),
-            Err(halt) => Err(halt),
-        }
+        let mut walker = Walker {
+            policy: &mut reduce,
+            state,
+            fuel,
+            interrupted,
+        };
+        let outcome = walker.term();
+        let state = walker.state;
+        let last = reduce.last;
+        // A walk that only ran out of allowance stands in front of a node it
+        // has not looked at yet, and nothing but the walk itself changes the
+        // net in the meantime, so it can go on from there.
+        self.progress = match outcome {
+            Err(Halt::OutOfFuel | Halt::Interrupted) => Progress::Suspended(state),
+            Ok(_) => Progress::Normal,
+            Err(Halt::Malformed(_)) => Progress::Idle,
+        };
+        (outcome, last)
     }
 
     /// The active pair that `step` would rewrite, or `None` if the net is in
     /// normal form.
     pub fn next(&self) -> Result<Option<Redex>, Halt> {
+        if matches!(self.progress, Progress::Normal) {
+            return Ok(None);
+        }
+        // A walk that stopped for want of allowance stands in front of the
+        // very pair it would have rewritten next.
+        if let Progress::Suspended(Suspended { top, .. }) = &self.progress {
+            let (upper, lower) = (top.exit, self.net.peer(top.exit));
+            if upper.is_principal()
+                && lower.is_principal()
+                && let Some(rule) =
+                    rules::rule_for(self.net.kind(upper.node), self.net.kind(lower.node))
+            {
+                return Ok(Some(Redex {
+                    upper: upper.node,
+                    lower: lower.node,
+                    rule,
+                }));
+            }
+        }
         let mut scout = Scout {
             net: &self.net,
             found: None,
         };
-        match walk(&mut scout, u64::MAX, None) {
+        match read(&mut scout, u64::MAX) {
             Ok(_) | Err(Halt::OutOfFuel) => Ok(scout.found),
             Err(halt) => Err(halt),
         }
@@ -210,7 +285,7 @@ impl Machine {
     /// more than `fuel` units of work, counted as in
     /// [`normalize`](Machine::normalize).
     pub fn readback_within(&self, fuel: u64) -> Result<Option<Term>, Halt> {
-        match walk(&mut Observe(&self.net), fuel, None) {
+        match read(&mut Observe(&self.net), fuel) {
             Ok(term) => Ok(Some(term)),
             Err(Halt::OutOfFuel) => Ok(None),
             Err(halt) => Err(halt),
@@ -229,7 +304,7 @@ impl Machine {
 
 /// Reads a net as a term without rewriting anything.
 pub fn readback(net: &Net) -> Result<Term, Halt> {
-    walk(&mut Observe(net), u64::MAX, None)
+    read(&mut Observe(net), u64::MAX)
 }
 
 /// What a walk does with the active pairs it comes across.
@@ -328,28 +403,21 @@ impl Policy for Reduce<'_> {
     }
 }
 
-/// Reads the term a net stands for, letting `policy` rewrite on the way.
-///
-/// `fuel` is the number of nodes the walk may come to, and `interrupted` is
-/// asked now and then whether to give up.
-fn walk(
-    policy: &mut impl Policy,
-    fuel: u64,
-    interrupted: Option<&dyn Fn() -> bool>,
-) -> Result<Term, Halt> {
-    let root = policy.net().root().principal();
+/// Reads the term a net stands for from the root, spending at most `fuel`.
+fn read(policy: &mut impl Policy, fuel: u64) -> Result<Term, Halt> {
+    let state = Suspended::at_root(policy.net());
     let mut walker = Walker {
         policy,
-        binders: Vec::new(),
-        passed: Vec::new(),
+        state,
         fuel,
-        interrupted,
+        interrupted: None,
     };
-    walker.term(root)
+    walker.term()
 }
 
 /// A point on the way down: the port the walk leaves a node by, and the
 /// context it carries from there.
+#[derive(Clone, Debug)]
 struct Frame {
     exit: Port,
     context: Context,
@@ -363,6 +431,7 @@ enum Head {
 }
 
 /// What is left to do once the term being read is complete.
+#[derive(Clone, Debug)]
 enum Pending {
     /// Read the argument of this application, in this context, and apply the
     /// term to it.
@@ -373,41 +442,68 @@ enum Pending {
     Function(Term),
 }
 
-/// How often, in units of fuel, a walk asks whether it was interrupted.
-const INTERRUPT_CHECK: u64 = 1 << 10;
-
-struct Walker<'a, P> {
-    policy: &'a mut P,
+/// Where a walk is, and all it needs to go on from there.
+#[derive(Clone, Debug)]
+struct Suspended {
     /// The abstractions around the current position, outermost first.
     binders: Vec<NodeId>,
     /// The frames passed on the way to the head being looked for, the
     /// starting one first.
     passed: Vec<Frame>,
+    /// The frame the walk goes on from.
+    top: Frame,
+    /// What waits for the term being read, the innermost last.
+    pending: Vec<Pending>,
+}
+
+impl Suspended {
+    /// A walk that has not left the root yet.
+    fn at_root(net: &Net) -> Suspended {
+        Suspended {
+            binders: Vec::new(),
+            passed: Vec::new(),
+            top: Frame {
+                exit: net.root().principal(),
+                context: Context::default(),
+            },
+            pending: Vec::new(),
+        }
+    }
+}
+
+/// How often, in units of fuel, a walk asks whether it was interrupted.
+const INTERRUPT_CHECK: u64 = 1 << 10;
+
+/// Reads the term a net stands for, letting its policy rewrite on the way.
+struct Walker<'a, P> {
+    policy: &'a mut P,
+    state: Suspended,
+    /// How many more nodes the walk may come to.
     fuel: u64,
+    /// Asked now and then whether to give up.
     interrupted: Option<&'a dyn Fn() -> bool>,
 }
 
 impl<P: Policy> Walker<'_, P> {
-    /// Reads the term hanging from `from`.
+    /// Reads the term from where the walk stands.
     ///
     /// The term can be nested deeper than any call stack, so what is left to
-    /// do is kept in a list, not in recursive calls.
-    fn term(&mut self, from: Port) -> Result<Term, Halt> {
-        let mut pending: Vec<Pending> = Vec::new();
-        let mut start = Frame {
-            exit: from,
-            context: Context::default(),
-        };
+    /// do is kept in a list, not in recursive calls. That list is also what
+    /// lets a walk that ran out of fuel be taken up again: an error leaves
+    /// the state in front of the node it stopped at.
+    fn term(&mut self) -> Result<Term, Halt> {
         loop {
-            let (head, context) = self.head(start, &mut pending)?;
+            let (head, context) = self.head()?;
+            let state = &mut self.state;
             let mut term = match head {
                 Head::Lam(node, name) => {
-                    pending.push(Pending::Body(self.policy.net().name(name).to_owned()));
-                    start = Frame {
+                    let name = self.policy.net().name(name).to_owned();
+                    state.pending.push(Pending::Body(name));
+                    state.top = Frame {
                         exit: node.port(slot::BODY),
-                        context: context.enter_abstraction(self.binders.len()),
+                        context: context.enter_abstraction(state.binders.len()),
                     };
-                    self.binders.push(node);
+                    state.binders.push(node);
                     continue;
                 }
                 Head::Bound(node) => {
@@ -416,43 +512,44 @@ impl<P: Policy> Walker<'_, P> {
                     // variable. The scope the walk is in does.
                     let binder = context
                         .binder()
-                        .filter(|&binder| self.binders.get(binder) == Some(&node))
+                        .filter(|&binder| state.binders.get(binder) == Some(&node))
                         .ok_or(Halt::Malformed("a variable occurs outside its binder"))?;
-                    Term::Var(self.binders.len() - 1 - binder)
+                    Term::Var(state.binders.len() - 1 - binder)
                 }
                 Head::Free(name) => Term::free(self.policy.net().name(name)),
             };
             // The term is complete: hand it to whatever waits for it, until
             // something needs another term read first.
-            start = loop {
-                match pending.pop() {
+            loop {
+                match state.pending.pop() {
                     None => return Ok(term),
                     Some(Pending::Argument(app, context)) => {
-                        pending.push(Pending::Function(term));
-                        break Frame {
+                        state.pending.push(Pending::Function(term));
+                        state.top = Frame {
                             exit: app.port(slot::ARG),
                             context,
                         };
+                        break;
                     }
                     Some(Pending::Body(name)) => {
-                        self.binders.pop();
+                        state.binders.pop();
                         term = Term::lam(name, term);
                     }
                     Some(Pending::Function(func)) => term = Term::app(func, term),
                 }
-            };
+            }
         }
     }
 
-    /// Goes down from `start` to the head of the term there, rewriting the
-    /// active pairs on the way if the policy does. Returns the head and the
-    /// context it is reached in, and adds to `pending` the applications
-    /// passed, the outermost first.
-    fn head(&mut self, start: Frame, pending: &mut Vec<Pending>) -> Result<(Head, Context), Halt> {
-        self.passed.clear();
-        let mut top = start;
+    /// Goes down from the top frame to the head of the term there, rewriting
+    /// the active pairs on the way if the policy does. Returns the head and
+    /// the context it is reached in, and adds the applications passed to
+    /// what is pending, the outermost first.
+    fn head(&mut self) -> Result<(Head, Context), Halt> {
         let head = loop {
             self.spend()?;
+            let state = &mut self.state;
+            let top = &mut state.top;
             let entry = self.policy.net().peer(top.exit);
             if top.exit.is_principal()
                 && entry.is_principal()
@@ -461,8 +558,8 @@ impl<P: Policy> Walker<'_, P> {
                 // The node of the top frame is gone. Whatever replaced it
                 // hangs from the frame before, so resume there. The starting
                 // frame is only ever the root, which survives.
-                if let Some(previous) = self.passed.pop() {
-                    top = previous;
+                if let Some(previous) = state.passed.pop() {
+                    *top = previous;
                 }
                 continue;
             }
@@ -516,21 +613,22 @@ impl<P: Policy> Walker<'_, P> {
                 (Kind::Eraser, _) => return Err(Halt::Malformed("the walk ran into an eraser")),
                 (Kind::Root, _) => return Err(Halt::Malformed("the walk came back to the root")),
             };
-            self.passed.push(std::mem::replace(&mut top, next));
+            state.passed.push(std::mem::replace(top, next));
         };
         // Nothing on this stretch will be rewritten any more, so only the
         // applications are still of interest: each takes an argument once
         // the head is done. Letting go of the fans and delimiters here is
         // what keeps the memory of a walk in proportion to the term it has
         // read, not to the length of the path it took.
-        let context = top.context.clone();
-        for frame in self.passed.drain(..).chain([top]) {
-            let node = frame.exit.node;
-            if frame.exit.is_principal() && self.policy.net().kind(node) == Kind::App {
-                pending.push(Pending::Argument(node, frame.context));
+        let state = &mut self.state;
+        let net = self.policy.net();
+        let frames = state.passed.drain(..).chain([state.top.clone()]);
+        for Frame { exit, context } in frames {
+            if exit.is_principal() && net.kind(exit.node) == Kind::App {
+                state.pending.push(Pending::Argument(exit.node, context));
             }
         }
-        Ok((head, context))
+        Ok((head, state.top.context.clone()))
     }
 
     /// Pays for one node the walk comes to.
@@ -706,6 +804,25 @@ mod tests {
         let mut limited = machine(source);
         assert!(limited.advance(3, false).unwrap().is_some());
         assert_eq!(limited.stats().interactions(), 3);
+    }
+
+    #[test]
+    fn a_finished_reduction_is_not_read_again_to_find_that_out() {
+        let mut machine = machine("2 2 2 2");
+        let term = machine.normalize(10_000_000).unwrap();
+        let stats = machine.stats();
+        // None of these walks the 131,075 nodes of the result again.
+        for _ in 0..100_000 {
+            assert_eq!(machine.step(), Ok(None));
+            assert_eq!(machine.next(), Ok(None));
+        }
+        assert_eq!(machine.advance(u64::MAX, true), Ok(None));
+        assert_eq!(machine.stats(), stats);
+        // The result is still there for the asking, within the fuel given.
+        assert_eq!(machine.normalize(10), Err(Halt::OutOfFuel));
+        assert_eq!(machine.normalize(10_000_000), Ok(term));
+        machine.collect();
+        assert_eq!(machine.next(), Ok(None));
     }
 
     #[test]

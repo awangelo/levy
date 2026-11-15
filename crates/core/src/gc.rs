@@ -73,9 +73,9 @@ pub fn collect(net: &mut Net) -> usize {
         net.remove(id);
     }
     for port in open {
-        let eraser = net.add(Kind::Eraser);
-        net.link(eraser.principal(), port);
+        net.plug(port);
     }
+    net.trim();
     doomed.len()
 }
 

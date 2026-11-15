@@ -6,6 +6,7 @@
 //! never fights the borrow checker.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Slot numbers of the ports of each kind of node.
 pub mod slot {
@@ -154,10 +155,15 @@ struct Symbols {
 pub struct Net {
     cells: Vec<Option<Node>>,
     vacant: Vec<NodeId>,
-    symbols: Symbols,
+    /// Shared between the copies of a net, which rarely learn new names.
+    symbols: Arc<Symbols>,
     root: NodeId,
     next_serial: u64,
+    next_plug_serial: u64,
 }
+
+/// Where the serials of the erasers added by [`Net::plug`] start.
+const PLUG_SERIALS: u64 = 1 << 63;
 
 impl Default for Net {
     fn default() -> Self {
@@ -171,9 +177,10 @@ impl Net {
         let mut net = Net {
             cells: Vec::new(),
             vacant: Vec::new(),
-            symbols: Symbols::default(),
+            symbols: Arc::default(),
             root: NodeId(0),
             next_serial: 0,
+            next_plug_serial: PLUG_SERIALS,
         };
         net.root = net.add(Kind::Root);
         net
@@ -189,6 +196,26 @@ impl Net {
         self.cells.len() - self.vacant.len()
     }
 
+    /// The number of places for nodes the net holds, in use or not: what a
+    /// copy of the net costs.
+    pub fn slots(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// Gives up the unused places at the end of the net, so that a net that
+    /// was large once does not stay large.
+    pub fn trim(&mut self) {
+        let used = self
+            .cells
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(0, |last| last + 1);
+        if used < self.cells.len() {
+            self.cells.truncate(used);
+            self.vacant.retain(|id| id.index() < used);
+        }
+    }
+
     /// Whether the net has no nodes. It never is: the root is always there.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -201,8 +228,9 @@ impl Net {
         }
         let index = u32::try_from(self.symbols.names.len()).expect("fewer than 2^32 names");
         let symbol = Symbol(index);
-        self.symbols.names.push(name.to_owned());
-        self.symbols.index.insert(name.to_owned(), symbol);
+        let symbols = Arc::make_mut(&mut self.symbols);
+        symbols.names.push(name.to_owned());
+        symbols.index.insert(name.to_owned(), symbol);
         symbol
     }
 
@@ -213,12 +241,31 @@ impl Net {
 
     /// Adds a node with all its ports unlinked.
     pub fn add(&mut self, kind: Kind) -> NodeId {
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        self.insert(kind, serial)
+    }
+
+    /// Adds an eraser on `port`, which was left open when what it led to
+    /// was removed.
+    ///
+    /// Such an eraser is numbered apart from the other nodes. Garbage can be
+    /// removed sooner or later, and this keeps the serials of the nodes a
+    /// reduction creates the same either way.
+    pub fn plug(&mut self, port: Port) -> NodeId {
+        let serial = self.next_plug_serial;
+        self.next_plug_serial += 1;
+        let eraser = self.insert(Kind::Eraser, serial);
+        self.link(eraser.principal(), port);
+        eraser
+    }
+
+    fn insert(&mut self, kind: Kind, serial: u64) -> NodeId {
         let node = Node {
             kind,
             links: [None; 3],
-            serial: self.next_serial,
+            serial,
         };
-        self.next_serial += 1;
         if let Some(id) = self.vacant.pop() {
             self.cells[id.index()] = Some(node);
             id
@@ -414,6 +461,22 @@ mod tests {
     }
 
     #[test]
+    fn trimming_gives_up_the_unused_end() {
+        let mut net = Net::new();
+        let nodes: Vec<NodeId> = (0..4).map(|_| net.add(Kind::Eraser)).collect();
+        net.remove(nodes[0]);
+        net.remove(nodes[2]);
+        net.remove(nodes[3]);
+        assert_eq!(net.slots(), 5);
+        net.trim();
+        // The hole in the middle stays, and is the next place used.
+        assert_eq!((net.slots(), net.len()), (3, 2));
+        assert_eq!(net.add(Kind::App), nodes[0]);
+        assert_eq!(net.add(Kind::App), nodes[2]);
+        assert_eq!((net.slots(), net.len()), (4, 4));
+    }
+
+    #[test]
     fn serials_are_never_reused() {
         let mut net = Net::new();
         let first = net.add(Kind::Eraser);
@@ -423,6 +486,19 @@ mod tests {
         let second = net.add(Kind::Eraser);
         assert_eq!(second, first);
         assert_ne!(net.serial(second), serial);
+    }
+
+    #[test]
+    fn plugs_leave_the_numbering_of_other_nodes_alone() {
+        let mut net = Net::new();
+        let first = net.add(Kind::App);
+        let plug = net.plug(first.port(slot::ARG));
+        let second = net.add(Kind::App);
+        assert_eq!(net.kind(plug), Kind::Eraser);
+        assert_eq!(net.peer(first.port(slot::ARG)), plug.principal());
+        assert_eq!(net.serial(second), net.serial(first) + 1);
+        let other = net.plug(second.port(slot::ARG));
+        assert_ne!(net.serial(plug), net.serial(other));
     }
 
     #[test]

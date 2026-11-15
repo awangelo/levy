@@ -19,7 +19,7 @@ const PRINT_LIMIT: usize = 2_000;
 const TRACE_LIMIT: u64 = 100;
 /// Work allowed for reading back one term of a trace. A term that takes
 /// more is too large to be worth printing.
-const TRACE_READ_FUEL: u64 = 100_000;
+const TRACE_READ_FUEL: u64 = 40_000;
 /// Interactions `:trace` fires between two looks at the interrupt flag.
 const TRACE_STRETCH: u64 = 100_000;
 
