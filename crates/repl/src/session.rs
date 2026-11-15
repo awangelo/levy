@@ -761,7 +761,7 @@ mod tests {
         let outcome = session.load(prelude, &mut transcript);
         assert_eq!(
             transcript.0,
-            [format!("loaded `{prelude}`: 21 definitions")],
+            [format!("loaded `{prelude}`: 27 definitions")],
             "the prelude loads without a remark"
         );
         assert!(!outcome.failed);
@@ -792,6 +792,24 @@ mod tests {
             ("and true true 1 2", 1),
             ("or false true 1 2", 1),
             ("or false false 1 2", 2),
+            ("leq 2 5 1 2", 1),
+            ("leq 5 2 1 2", 2),
+            ("leq 4 4 1 2", 1),
+            ("eq 0 0 1 2", 1),
+            ("eq 3 3 1 2", 1),
+            ("eq 3 4 1 2", 2),
+            ("eq 4 3 1 2", 2),
+            ("geq 5 2 1 2", 1),
+            ("geq 2 5 1 2", 2),
+            ("geq 4 4 1 2", 1),
+            ("lt 2 5 1 2", 1),
+            ("lt 5 2 1 2", 2),
+            ("lt 4 4 1 2", 2),
+            ("gt 5 2 1 2", 1),
+            ("gt 2 5 1 2", 2),
+            ("gt 4 4 1 2", 2),
+            ("neq 3 4 1 2", 1),
+            ("neq 3 3 1 2", 2),
         ] {
             let lines = run(&mut session, source);
             assert_eq!(

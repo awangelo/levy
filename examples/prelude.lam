@@ -26,6 +26,14 @@ iszero = \n. n (\x. false) true
 pred   = \n f x. n (\g h. h (g f)) (\u. x) (\u. u)
 minus  = \m n. n pred m
 
+-- Comparison of numerals: `minus` stops at 0, so `m - n` is 0 when m <= n
+leq = \m n. iszero (minus m n)
+geq = \m n. leq n m
+lt  = \m n. not (geq m n)
+gt  = \m n. not (leq m n)
+eq  = \m n. and (leq m n) (geq m n)
+neq = \m n. not (eq m n)
+
 -- Recursion
 fix  = \f. (\x. f (x x)) (\x. f (x x))
 fact = fix (\self n. iszero n 1 (times n (self (pred n))))
