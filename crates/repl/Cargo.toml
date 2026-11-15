@@ -7,7 +7,7 @@ edition.workspace = true
 [dependencies]
 ctrlc = "3.5"
 levy-core = { path = "../core" }
-rustyline = { version = "19.0.0", default-features = false, features = ["with-file-history"] }
+rustyline = { version = "19.0.0", default-features = false }
 
 [lints]
 workspace = true

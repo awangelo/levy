@@ -46,8 +46,7 @@ before it is defined stays a free variable. The REPL says so when it happens.
 
 Ctrl-C stops an evaluation and keeps the session. So does the fuel limit,
 which bounds the work of one evaluation, and with it its time and memory:
-`:fuel` shows it and `:fuel N` sets it. History is kept in
-`$XDG_STATE_HOME/levy/history`, or `~/.local/state/levy/history`.
+`:fuel` shows it and `:fuel N` sets it.
 
 In a file, a statement runs on over the indented lines that follow it.
 `:load` reports a bad statement with its line and column and goes on with

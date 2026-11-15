@@ -3,7 +3,6 @@
 mod session;
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -135,24 +134,10 @@ impl Runner {
     }
 }
 
-/// Where the lines typed at the prompt are kept between sessions.
-fn history_file() -> Option<PathBuf> {
-    let set = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
-    let state = set("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from(set("HOME")?).join(".local").join("state")))?;
-    Some(state.join("levy").join("history"))
-}
-
 fn interact(runner: &mut Runner) -> rustyline::Result<()> {
     println!("levy: optimal λ-reduction. `:help` lists the commands.");
     let mut editor = DefaultEditor::new()?;
-    let history = history_file();
-    if let Some(path) = &history {
-        // There is none on the first run.
-        let _ = editor.load_history(path);
-    }
-    let outcome = loop {
+    loop {
         match editor.readline("λ> ") {
             Ok(line) => {
                 if !line.trim().is_empty() {
@@ -168,15 +153,7 @@ fn interact(runner: &mut Runner) -> rustyline::Result<()> {
             Err(ReadlineError::Eof) => break Ok(()),
             Err(error) => break Err(error),
         }
-    };
-    if let Some(path) = &history {
-        // Losing the history is not worth a complaint on the way out.
-        if let Some(directory) = path.parent() {
-            let _ = std::fs::create_dir_all(directory);
-        }
-        let _ = editor.save_history(path);
     }
-    outcome
 }
 
 fn run(options: &Options) -> ExitCode {
