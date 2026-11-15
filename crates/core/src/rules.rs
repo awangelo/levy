@@ -161,12 +161,12 @@ fn commute(net: &mut Net, a: NodeId, b: NodeId) {
 /// What a node of kind `me` becomes once it has passed through `other`.
 fn crossing(me: Kind, other: Kind) -> Kind {
     let raised = |level: u32| match other {
-        Kind::Lam { .. } => level + 1,
+        Kind::Lam { .. } => sum(level, 1),
         // Each delimiter of the stack is one more scope to be inside of.
         Kind::Delim {
             level: border,
             count,
-        } if border <= level => level + count,
+        } if border <= level => sum(level, count),
         _ => level,
     };
     match me {
@@ -179,6 +179,14 @@ fn crossing(me: Kind, other: Kind) -> Kind {
         },
         other => other,
     }
+}
+
+/// Adds levels or heights. Either would take more interactions than a
+/// machine can run to get anywhere near the limit, so this is not something
+/// to recover from.
+fn sum(a: u32, b: u32) -> u32 {
+    a.checked_add(b)
+        .expect("levels and heights stay far below 2^32")
 }
 
 fn dissolve(net: &mut Net, delimiter: NodeId, anchor: NodeId) {
@@ -215,7 +223,7 @@ pub fn merge(net: &mut Net, exit: Port) -> Option<(u32, u32)> {
         exit.node,
         Kind::Delim {
             level,
-            count: count + more,
+            count: sum(count, more),
         },
     );
     let far_side = if entry.is_principal() {

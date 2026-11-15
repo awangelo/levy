@@ -7,8 +7,9 @@ use levy_core::script::statements;
 use levy_core::translate::translate;
 use levy_core::{Definitions, Halt, Machine, ParseError, Rule, Statement, Term, reference};
 
-/// Interactions allowed per evaluation unless `:fuel` says otherwise.
-const DEFAULT_FUEL: u64 = 50_000_000;
+/// Work allowed per evaluation unless `:fuel` says otherwise, in steps of the
+/// machine's walk. This is a few seconds, and bounds the memory as well.
+const DEFAULT_FUEL: u64 = 100_000_000;
 /// Terms larger than this many nodes are summarized instead of printed.
 const PRINT_LIMIT: usize = 2_000;
 /// Beta-steps `:trace` prints before it stops.
@@ -28,7 +29,7 @@ Commands:
   :dot TERM       print the net of TERM in Graphviz format
   :load FILE      run the statements of a file
   :defs           list the definitions
-  :fuel [N]       show or set the interaction limit per evaluation
+  :fuel [N]       show or set the limit on the work of one evaluation
   :help           show this text
   :quit           leave";
 
@@ -249,7 +250,7 @@ impl Session {
 
     fn set_fuel(&mut self, argument: &str, out: &mut Vec<String>) {
         if argument.is_empty() {
-            out.push(format!("{} interactions per evaluation", self.fuel));
+            out.push(format!("{} steps per evaluation", self.fuel));
             return;
         }
         match argument.replace('_', "").parse() {
@@ -261,10 +262,13 @@ impl Session {
     fn explain(&self, halt: Halt, machine: &Machine) -> String {
         match halt {
             Halt::OutOfFuel => format!(
-                "no normal form after {} interactions ({} β-steps); raise the limit with `:fuel`",
+                "no normal form within {} steps ({} interactions, {} β-steps); \
+                 raise the limit with `:fuel`",
+                self.fuel,
                 machine.stats().interactions(),
                 machine.stats().beta
             ),
+            Halt::Interrupted => "interrupted".to_owned(),
             Halt::Malformed(reason) => format!("internal error: malformed net: {reason}"),
         }
     }
@@ -355,13 +359,10 @@ mod tests {
     fn divergence_stops_at_the_fuel_limit() {
         let mut session = Session::new();
         assert!(run(&mut session, ":fuel 1_000").is_empty());
-        assert_eq!(
-            run(&mut session, ":fuel"),
-            ["1000 interactions per evaluation"]
-        );
+        assert_eq!(run(&mut session, ":fuel"), ["1000 steps per evaluation"]);
         let lines = run(&mut session, r"(\x. x x) (\x. x x)");
         assert!(
-            lines[0].starts_with("no normal form after 1000 interactions"),
+            lines[0].starts_with("no normal form within 1000 steps ("),
             "{lines:?}"
         );
     }

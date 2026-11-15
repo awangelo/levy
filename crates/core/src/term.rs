@@ -3,10 +3,15 @@
 //! Binder names are kept only as hints for printing. Equality is
 //! α-equivalence: two terms are equal when they differ at most in those hints.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, OnceLock};
 
 /// An untyped λ-term.
+///
+/// Subterms are shared, so cloning a term is cheap whatever its size. Nothing
+/// here recurses on the shape of a term: printing, comparing, measuring and
+/// dropping all work on terms nested millions deep.
 #[derive(Clone, Debug)]
 pub enum Term {
     /// A bound variable, as a de Bruijn index (0 is the innermost binder).
@@ -14,22 +19,25 @@ pub enum Term {
     /// A free variable, identified by its name.
     Free(String),
     /// An abstraction. The name is a printing hint.
-    Lam(String, Box<Term>),
+    Lam(String, Arc<Term>),
     /// An application of a function to an argument.
-    App(Box<Term>, Box<Term>),
+    App(Arc<Term>, Arc<Term>),
 }
 
 impl Term {
+    /// The free variable called `name`.
     pub fn free(name: impl Into<String>) -> Term {
         Term::Free(name.into())
     }
 
+    /// The abstraction `λname. body`. Index 0 in `body` refers to it.
     pub fn lam(name: impl Into<String>, body: Term) -> Term {
-        Term::Lam(name.into(), Box::new(body))
+        Term::Lam(name.into(), Arc::new(body))
     }
 
+    /// The application `func arg`.
     pub fn app(func: Term, arg: Term) -> Term {
-        Term::App(Box::new(func), Box::new(arg))
+        Term::App(Arc::new(func), Arc::new(arg))
     }
 
     /// The Church numeral `λf. λx. f (f ... (f x))` with `n` applications.
@@ -62,10 +70,22 @@ impl Term {
 
     /// The number of variables, abstractions and applications in the term.
     pub fn size(&self) -> usize {
-        match self {
-            Term::Var(_) | Term::Free(_) => 1,
-            Term::Lam(_, body) => 1 + body.size(),
-            Term::App(func, arg) => 1 + func.size() + arg.size(),
+        let mut size = 0;
+        let mut pending: Vec<&Term> = Vec::new();
+        let mut term = self;
+        loop {
+            size += 1;
+            term = match term {
+                Term::Lam(_, body) => body,
+                Term::App(func, arg) => {
+                    pending.push(arg);
+                    func
+                }
+                Term::Var(_) | Term::Free(_) => match pending.pop() {
+                    Some(next) => next,
+                    None => return size,
+                },
+            };
         }
     }
 
@@ -82,23 +102,65 @@ impl Term {
 
     /// The names of the free variables, sorted and without repeats.
     pub fn free_names(&self) -> Vec<&str> {
-        let mut names = HashSet::new();
-        self.collect_free_names(&mut names);
-        let mut names: Vec<&str> = names.into_iter().collect();
+        let mut names: Vec<&str> = self.free_name_set().into_iter().collect();
         names.sort_unstable();
         names
     }
 
-    fn collect_free_names<'a>(&'a self, names: &mut HashSet<&'a str>) {
-        match self {
-            Term::Var(_) => {}
-            Term::Free(name) => {
-                names.insert(name);
+    fn free_name_set(&self) -> HashSet<&str> {
+        let mut names = HashSet::new();
+        let mut pending: Vec<&Term> = vec![self];
+        while let Some(term) = pending.pop() {
+            match term {
+                Term::Var(_) => {}
+                Term::Free(name) => {
+                    names.insert(name.as_str());
+                }
+                Term::Lam(_, body) => pending.push(body),
+                Term::App(func, arg) => {
+                    pending.push(arg);
+                    pending.push(func);
+                }
             }
-            Term::Lam(_, body) => body.collect_free_names(names),
+        }
+        names
+    }
+
+    /// Moves the subterms that have subterms of their own into `pending`,
+    /// leaving leaves in their place.
+    fn detach(&mut self, pending: &mut Vec<Arc<Term>>) {
+        let mut take = |child: &mut Arc<Term>| {
+            if matches!(child.as_ref(), Term::Lam(..) | Term::App(..)) {
+                pending.push(std::mem::replace(child, leaf()));
+            }
+        };
+        match self {
+            Term::Var(_) | Term::Free(_) => {}
+            Term::Lam(_, body) => take(body),
             Term::App(func, arg) => {
-                func.collect_free_names(names);
-                arg.collect_free_names(names);
+                take(func);
+                take(arg);
+            }
+        }
+    }
+}
+
+/// A leaf to put where a subterm was taken out.
+fn leaf() -> Arc<Term> {
+    static LEAF: OnceLock<Arc<Term>> = OnceLock::new();
+    LEAF.get_or_init(|| Arc::new(Term::Var(0))).clone()
+}
+
+impl Drop for Term {
+    /// Takes the term apart with a worklist, so that dropping a deep term
+    /// cannot overflow the call stack.
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        self.detach(&mut pending);
+        while let Some(child) = pending.pop() {
+            // A subterm that something else still shares is left alone.
+            if let Some(mut term) = Arc::into_inner(child) {
+                term.detach(&mut pending);
             }
         }
     }
@@ -106,12 +168,27 @@ impl Term {
 
 impl PartialEq for Term {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Term::Var(a), Term::Var(b)) => a == b,
-            (Term::Free(a), Term::Free(b)) => a == b,
-            (Term::Lam(_, a), Term::Lam(_, b)) => a == b,
-            (Term::App(f, a), Term::App(g, b)) => f == g && a == b,
-            _ => false,
+        let mut pending: Vec<(&Term, &Term)> = Vec::new();
+        let mut pair = (self, other);
+        loop {
+            pair = match pair {
+                (Term::Lam(_, a), Term::Lam(_, b)) => (a, b),
+                (Term::App(f, a), Term::App(g, b)) => {
+                    if !Arc::ptr_eq(a, b) {
+                        pending.push((a, b));
+                    }
+                    (f, g)
+                }
+                (Term::Var(a), Term::Var(b)) if a == b => match pending.pop() {
+                    Some(next) => next,
+                    None => return true,
+                },
+                (Term::Free(a), Term::Free(b)) if a == b => match pending.pop() {
+                    Some(next) => next,
+                    None => return true,
+                },
+                _ => return false,
+            };
         }
     }
 }
@@ -120,13 +197,16 @@ impl Eq for Term {}
 
 impl fmt::Display for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut reserved = HashSet::new();
-        self.collect_free_names(&mut reserved);
         let mut printer = Printer {
             scope: Vec::new(),
-            reserved,
+            taken: self
+                .free_name_set()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            next_suffix: HashMap::new(),
         };
-        printer.write(self, f, Position::Body)
+        printer.write(self, f)
     }
 }
 
@@ -141,85 +221,122 @@ enum Position {
     Argument,
 }
 
-struct Printer<'a> {
-    /// Names of the enclosing binders, innermost last.
-    scope: Vec<String>,
-    /// Free variable names, which binders must not capture.
-    reserved: HashSet<&'a str>,
+/// What is left to print.
+enum Task<'a> {
+    Term(&'a Term, Position),
+    Text(&'static str),
+    /// Forget the binders beyond this many: their abstraction is over.
+    Leave(usize),
 }
 
-impl Printer<'_> {
-    fn write(
-        &mut self,
-        term: &Term,
-        f: &mut fmt::Formatter<'_>,
-        position: Position,
-    ) -> fmt::Result {
-        match term {
-            Term::Var(index) => match self.scope.len().checked_sub(index + 1) {
-                Some(slot) => f.write_str(&self.scope[slot]),
-                None => write!(f, "#{}", index - self.scope.len()),
-            },
-            Term::Free(name) => f.write_str(name),
-            Term::Lam(..) => {
-                let parenthesized = position != Position::Body;
-                if parenthesized {
-                    f.write_str("(")?;
+struct Printer {
+    /// Names of the enclosing binders, innermost last.
+    scope: Vec<String>,
+    /// The names in `scope` and those of the free variables, none of which a
+    /// new binder may take.
+    taken: HashSet<String>,
+    /// Per stem, a suffix below which every numbered name is taken.
+    next_suffix: HashMap<String, u64>,
+}
+
+impl Printer {
+    fn write(&mut self, term: &Term, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut tasks = vec![Task::Term(term, Position::Body)];
+        while let Some(task) = tasks.pop() {
+            let (term, position) = match task {
+                Task::Term(term, position) => (term, position),
+                Task::Text(text) => {
+                    f.write_str(text)?;
+                    continue;
                 }
-                f.write_str("λ")?;
-                let depth = self.scope.len();
-                let mut inner = term;
-                while let Term::Lam(hint, body) = inner {
-                    if self.scope.len() > depth {
-                        f.write_str(" ")?;
+                Task::Leave(depth) => {
+                    self.leave(depth);
+                    continue;
+                }
+            };
+            match term {
+                Term::Var(index) => {
+                    let slot = index
+                        .checked_add(1)
+                        .and_then(|above| self.scope.len().checked_sub(above));
+                    match slot {
+                        Some(slot) => f.write_str(&self.scope[slot])?,
+                        None => write!(f, "#{}", index - self.scope.len())?,
                     }
-                    let name = self.fresh(hint);
-                    f.write_str(&name)?;
-                    self.scope.push(name);
-                    inner = body;
                 }
-                f.write_str(". ")?;
-                self.write(inner, f, Position::Body)?;
-                self.scope.truncate(depth);
-                if parenthesized {
-                    f.write_str(")")?;
+                Term::Free(name) => f.write_str(name)?,
+                Term::Lam(..) => {
+                    let parenthesized = position != Position::Body;
+                    if parenthesized {
+                        f.write_str("(")?;
+                        tasks.push(Task::Text(")"));
+                    }
+                    f.write_str("λ")?;
+                    let depth = self.scope.len();
+                    let mut inner = term;
+                    while let Term::Lam(hint, body) = inner {
+                        if self.scope.len() > depth {
+                            f.write_str(" ")?;
+                        }
+                        let name = self.fresh(hint);
+                        f.write_str(&name)?;
+                        self.taken.insert(name.clone());
+                        self.scope.push(name);
+                        inner = body;
+                    }
+                    f.write_str(". ")?;
+                    tasks.push(Task::Leave(depth));
+                    tasks.push(Task::Term(inner, Position::Body));
                 }
-                Ok(())
-            }
-            Term::App(func, arg) => {
-                let parenthesized = position == Position::Argument;
-                if parenthesized {
-                    f.write_str("(")?;
+                Term::App(func, arg) => {
+                    if position == Position::Argument {
+                        f.write_str("(")?;
+                        tasks.push(Task::Text(")"));
+                    }
+                    tasks.push(Task::Term(arg, Position::Argument));
+                    tasks.push(Task::Text(" "));
+                    tasks.push(Task::Term(func, Position::Function));
                 }
-                self.write(func, f, Position::Function)?;
-                f.write_str(" ")?;
-                self.write(arg, f, Position::Argument)?;
-                if parenthesized {
-                    f.write_str(")")?;
-                }
-                Ok(())
             }
         }
+        Ok(())
     }
 
     /// Picks a binder name close to `hint` that shadows nothing in scope.
-    fn fresh(&self, hint: &str) -> String {
-        let taken = |name: &str| {
-            self.reserved.contains(name) || self.scope.iter().any(|bound| bound == name)
-        };
+    fn fresh(&mut self, hint: &str) -> String {
         let hint = if hint.is_empty() { "x" } else { hint };
-        if !taken(hint) {
+        if !self.taken.contains(hint) {
             return hint.to_owned();
         }
         let stem = hint.trim_end_matches(|c: char| c.is_ascii_digit());
         let stem = if stem.is_empty() { "x" } else { stem };
-        let mut suffix = 1u64;
+        let mut suffix = self.next_suffix.get(stem).copied().unwrap_or(1);
         loop {
             let candidate = format!("{stem}{suffix}");
-            if !taken(&candidate) {
+            suffix += 1;
+            if !self.taken.contains(&candidate) {
+                self.next_suffix.insert(stem.to_owned(), suffix);
                 return candidate;
             }
-            suffix += 1;
+        }
+    }
+
+    /// Forgets the binders beyond the first `depth`.
+    fn leave(&mut self, depth: usize) {
+        for name in self.scope.drain(depth..) {
+            self.taken.remove(&name);
+            // The name is free again, so a search for one like it must not
+            // start beyond it.
+            let stem = name.trim_end_matches(|c: char| c.is_ascii_digit());
+            let Some(next) = self.next_suffix.get_mut(stem) else {
+                continue;
+            };
+            if let Ok(suffix) = name[stem.len()..].parse::<u64>()
+                && suffix < *next
+                && format!("{stem}{suffix}") == name
+            {
+                *next = suffix;
+            }
         }
     }
 }
@@ -283,5 +400,76 @@ mod tests {
             assert_eq!(Term::church(n).as_church(), Some(n));
         }
         assert_eq!(Term::lam("x", Term::Var(0)).as_church(), None);
+    }
+
+    #[test]
+    fn names_are_reused_once_their_binder_is_closed() {
+        let twice = Term::lam("x", Term::lam("x", Term::Var(0)));
+        let term = Term::app(twice.clone(), twice);
+        assert_eq!(term.to_string(), "(λx x1. x1) (λx x1. x1)");
+        // A hint that is free again is taken as it is.
+        let term = Term::lam(
+            "y",
+            Term::app(
+                Term::lam("y1", Term::lam("y", Term::Var(0))),
+                Term::lam("y", Term::lam("y", Term::Var(2))),
+            ),
+        );
+        assert_eq!(term.to_string(), "λy. (λy1 y2. y2) (λy1 y2. y)");
+    }
+
+    #[test]
+    fn many_binders_of_one_name_get_numbers_in_order() {
+        let term = (0..3_000).fold(Term::Var(0), |body, _| Term::lam("y", body));
+        let text = term.to_string();
+        assert!(text.starts_with("λy y1 y2 y3 "), "{}", &text[..40]);
+        assert!(
+            text.ends_with(" y2998 y2999. y2999"),
+            "{}",
+            &text[text.len() - 40..]
+        );
+    }
+
+    #[test]
+    fn dangling_indices_print_as_numbers() {
+        assert_eq!(Term::Var(2).to_string(), "#2");
+        assert_eq!(Term::lam("x", Term::Var(3)).to_string(), "λx. #2");
+        assert_eq!(
+            Term::Var(usize::MAX).to_string(),
+            format!("#{}", usize::MAX)
+        );
+    }
+
+    #[test]
+    fn deep_terms_need_no_deep_stack() {
+        let depth = 300_000;
+        let numeral = Term::church(depth);
+        assert_eq!(numeral.size(), 2 * 300_000 + 3);
+        assert_eq!(numeral, numeral.clone());
+        assert_ne!(numeral, Term::church(depth - 1));
+        assert!(numeral.free_names().is_empty());
+        let text = numeral.to_string();
+        assert!(text.starts_with("λf x. f (f (f "));
+        assert!(text.trim_end_matches(')').ends_with("(f x"));
+        // A chain nested on the function side, and a tower of binders.
+        let chain = (0..depth).fold(Term::free("a"), |func, _| Term::app(func, Term::free("b")));
+        assert_eq!(chain.size(), 2 * 300_000 + 1);
+        assert_eq!(chain.free_names(), ["a", "b"]);
+        let tower = (0..depth).fold(Term::Var(0), |body, _| Term::lam("", body));
+        assert_eq!(tower.size(), 300_001);
+        drop((numeral, chain, tower));
+    }
+
+    #[test]
+    fn shared_subterms_survive_their_other_owners() {
+        let shared = Term::church(1_000);
+        let user = Term::app(shared.clone(), shared.clone());
+        drop(shared);
+        assert_eq!(user.size(), 2 * 2_003 + 1);
+        let Term::App(func, arg) = &user else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(func, arg) || func == arg);
+        assert_eq!(func.as_church(), Some(1_000));
     }
 }

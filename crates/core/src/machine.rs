@@ -61,8 +61,10 @@ impl Stats {
 /// Why a walk stopped before producing a term.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Halt {
-    /// The interaction allowance ran out. The machine can be resumed.
+    /// The allowance of work ran out. The machine can be resumed.
     OutOfFuel,
+    /// The caller asked the walk to stop. The machine can be resumed.
+    Interrupted,
     /// The net does not represent a term. This points at a bug in the rules.
     Malformed(&'static str),
 }
@@ -71,6 +73,7 @@ impl fmt::Display for Halt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Halt::OutOfFuel => f.write_str("ran out of fuel"),
+            Halt::Interrupted => f.write_str("interrupted"),
             Halt::Malformed(reason) => write!(f, "malformed net: {reason}"),
         }
     }
@@ -112,34 +115,66 @@ impl Machine {
         })
     }
 
+    /// The net as it stands.
     pub fn net(&self) -> &Net {
         &self.net
     }
 
+    /// How many times each rule has fired so far.
     pub fn stats(&self) -> Stats {
         self.stats
     }
 
-    /// Reduces to normal form and returns it, firing at most `fuel`
-    /// interactions.
+    /// Reduces to normal form and returns it.
+    ///
+    /// `fuel` bounds the work, and with it the time and the memory the call
+    /// takes: every node of the net the walk comes to costs one unit, whether
+    /// it is rewritten there or only passed. A normal form of `n` nodes
+    /// therefore needs at least `n` units. When the fuel runs out the call
+    /// returns [`Halt::OutOfFuel`] and leaves the net as far as it got; a
+    /// later call takes up the reduction from there, reading again from the
+    /// root.
     pub fn normalize(&mut self, fuel: u64) -> Result<Term, Halt> {
+        self.normalize_unless(fuel, &|| false)
+    }
+
+    /// Like [`normalize`](Machine::normalize), but asks `interrupted` every
+    /// thousand units or so whether to give up, and returns
+    /// [`Halt::Interrupted`] once it says yes.
+    pub fn normalize_unless(
+        &mut self,
+        fuel: u64,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Term, Halt> {
         let mut reduce = Reduce {
             machine: self,
-            fuel,
+            interactions: u64::MAX,
+            until_beta: false,
             last: None,
         };
-        walk(&mut reduce)
+        walk(&mut reduce, fuel, Some(interrupted))
     }
 
     /// Fires the next interaction of the reduction and reports its rule, or
     /// returns `None` if the net is in normal form.
     pub fn step(&mut self) -> Result<Option<Rule>, Halt> {
+        self.advance(1, false)
+    }
+
+    /// Fires up to `interactions` interactions in one walk, and with
+    /// `until_beta` stops after the first beta among them. Reports the rule
+    /// fired last, or `None` if the net was in normal form already.
+    ///
+    /// Every call reads the net from the root, so one call for many
+    /// interactions is much cheaper than many calls to [`step`](Machine::step).
+    pub fn advance(&mut self, interactions: u64, until_beta: bool) -> Result<Option<Rule>, Halt> {
         let mut reduce = Reduce {
             machine: self,
-            fuel: 1,
+            interactions,
+            until_beta,
             last: None,
         };
-        match walk(&mut reduce) {
+        match walk(&mut reduce, u64::MAX, None) {
             Ok(_) | Err(Halt::OutOfFuel) => Ok(reduce.last),
             Err(halt) => Err(halt),
         }
@@ -152,15 +187,29 @@ impl Machine {
             net: &self.net,
             found: None,
         };
-        match walk(&mut scout) {
+        match walk(&mut scout, u64::MAX, None) {
             Ok(_) | Err(Halt::OutOfFuel) => Ok(scout.found),
             Err(halt) => Err(halt),
         }
     }
 
     /// The term the net stands for right now.
+    ///
+    /// A small net can stand for a huge term. Use
+    /// [`readback_within`](Machine::readback_within) to bound the work.
     pub fn readback(&self) -> Result<Term, Halt> {
         readback(&self.net)
+    }
+
+    /// The term the net stands for right now, or `None` if reading it takes
+    /// more than `fuel` units of work, counted as in
+    /// [`normalize`](Machine::normalize).
+    pub fn readback_within(&self, fuel: u64) -> Result<Option<Term>, Halt> {
+        match walk(&mut Observe(&self.net), fuel, None) {
+            Ok(term) => Ok(Some(term)),
+            Err(Halt::OutOfFuel) => Ok(None),
+            Err(halt) => Err(halt),
+        }
     }
 
     /// Removes the nodes the result no longer depends on and returns how
@@ -175,7 +224,7 @@ impl Machine {
 
 /// Reads a net as a term without rewriting anything.
 pub fn readback(net: &Net) -> Result<Term, Halt> {
-    walk(&mut Observe(net))
+    walk(&mut Observe(net), u64::MAX, None)
 }
 
 /// What a walk does with the active pairs it comes across.
@@ -208,7 +257,7 @@ impl Policy for Observe<'_> {
 }
 
 /// Rewrites nothing, and stops at the first pair that could be rewritten: a
-/// reducer with no fuel that remembers what it ran out of fuel for.
+/// reducer with no allowance that remembers what it wanted to rewrite.
 struct Scout<'a> {
     net: &'a Net,
     found: Option<Redex>,
@@ -230,10 +279,13 @@ impl Policy for Scout<'_> {
     }
 }
 
-/// Rewrites every active pair on the way, while the fuel lasts.
+/// Rewrites every active pair on the way, while its allowance lasts.
 struct Reduce<'a> {
     machine: &'a mut Machine,
-    fuel: u64,
+    /// How many more interactions may fire.
+    interactions: u64,
+    /// Whether to fire nothing more once a beta has fired.
+    until_beta: bool,
     last: Option<Rule>,
 }
 
@@ -247,10 +299,16 @@ impl Policy for Reduce<'_> {
         if rules::rule_for(net.kind(upper), net.kind(lower)).is_none() {
             return Ok(false);
         }
-        self.fuel = self.fuel.checked_sub(1).ok_or(Halt::OutOfFuel)?;
+        // The walk stops at the pair it may not rewrite, not right after the
+        // last one it did: the delimiters in between are merged by then, so
+        // the next walk finds the net as `next` describes it.
+        self.interactions = self.interactions.checked_sub(1).ok_or(Halt::OutOfFuel)?;
         if let Some(rule) = rules::apply(net, upper, lower) {
             self.machine.stats.record(rule);
             self.last = Some(rule);
+            if self.until_beta && rule == Rule::Beta {
+                self.interactions = 0;
+            }
         }
         // Everything the walk holds on to is reachable from the root, so
         // collecting in the middle of it is safe.
@@ -265,13 +323,24 @@ impl Policy for Reduce<'_> {
     }
 }
 
-fn walk(policy: &mut impl Policy) -> Result<Term, Halt> {
+/// Reads the term a net stands for, letting `policy` rewrite on the way.
+///
+/// `fuel` is the number of nodes the walk may come to, and `interrupted` is
+/// asked now and then whether to give up.
+fn walk(
+    policy: &mut impl Policy,
+    fuel: u64,
+    interrupted: Option<&dyn Fn() -> bool>,
+) -> Result<Term, Halt> {
     let root = policy.net().root().principal();
     let mut walker = Walker {
         policy,
         binders: Vec::new(),
+        passed: Vec::new(),
+        fuel,
+        interrupted,
     };
-    walker.term(root, Context::default())
+    walker.term(root)
 }
 
 /// A point on the way down: the port the walk leaves a node by, and the
@@ -288,22 +357,97 @@ enum Head {
     Free(Symbol),
 }
 
+/// What is left to do once the term being read is complete.
+enum Pending {
+    /// Read the argument of this application, in this context, and apply the
+    /// term to it.
+    Argument(NodeId, Context),
+    /// The term is the body of an abstraction of this name: close it.
+    Body(String),
+    /// The term is an argument: apply this function to it.
+    Function(Term),
+}
+
+/// How often, in units of fuel, a walk asks whether it was interrupted.
+const INTERRUPT_CHECK: u64 = 1 << 10;
+
 struct Walker<'a, P> {
     policy: &'a mut P,
     /// The abstractions around the current position, outermost first.
     binders: Vec<NodeId>,
+    /// The frames passed on the way to the head being looked for, the
+    /// starting one first.
+    passed: Vec<Frame>,
+    fuel: u64,
+    interrupted: Option<&'a dyn Fn() -> bool>,
 }
 
 impl<P: Policy> Walker<'_, P> {
     /// Reads the term hanging from `from`.
-    fn term(&mut self, from: Port, context: Context) -> Result<Term, Halt> {
-        // The frames passed on the way to the head, the starting one first.
-        let mut passed: Vec<Frame> = Vec::new();
-        let mut top = Frame {
+    ///
+    /// The term can be nested deeper than any call stack, so what is left to
+    /// do is kept in a list, not in recursive calls.
+    fn term(&mut self, from: Port) -> Result<Term, Halt> {
+        let mut pending: Vec<Pending> = Vec::new();
+        let mut start = Frame {
             exit: from,
-            context,
+            context: Context::default(),
         };
+        loop {
+            let (head, context) = self.head(start, &mut pending)?;
+            let mut term = match head {
+                Head::Lam(node, name) => {
+                    pending.push(Pending::Body(self.policy.net().name(name).to_owned()));
+                    start = Frame {
+                        exit: node.port(slot::BODY),
+                        context: context.enter_abstraction(self.binders.len()),
+                    };
+                    self.binders.push(node);
+                    continue;
+                }
+                Head::Bound(node) => {
+                    // A shared abstraction can occur inside a copy of itself,
+                    // so the node alone does not say which copy binds the
+                    // variable. The scope the walk is in does.
+                    let binder = context
+                        .binder()
+                        .filter(|&binder| self.binders.get(binder) == Some(&node))
+                        .ok_or(Halt::Malformed("a variable occurs outside its binder"))?;
+                    Term::Var(self.binders.len() - 1 - binder)
+                }
+                Head::Free(name) => Term::free(self.policy.net().name(name)),
+            };
+            // The term is complete: hand it to whatever waits for it, until
+            // something needs another term read first.
+            start = loop {
+                match pending.pop() {
+                    None => return Ok(term),
+                    Some(Pending::Argument(app, context)) => {
+                        pending.push(Pending::Function(term));
+                        break Frame {
+                            exit: app.port(slot::ARG),
+                            context,
+                        };
+                    }
+                    Some(Pending::Body(name)) => {
+                        self.binders.pop();
+                        term = Term::lam(name, term);
+                    }
+                    Some(Pending::Function(func)) => term = Term::app(func, term),
+                }
+            };
+        }
+    }
+
+    /// Goes down from `start` to the head of the term there, rewriting the
+    /// active pairs on the way if the policy does. Returns the head and the
+    /// context it is reached in, and adds to `pending` the applications
+    /// passed, the outermost first.
+    fn head(&mut self, start: Frame, pending: &mut Vec<Pending>) -> Result<(Head, Context), Halt> {
+        self.passed.clear();
+        let mut top = start;
         let head = loop {
+            self.spend()?;
             let entry = self.policy.net().peer(top.exit);
             if top.exit.is_principal()
                 && entry.is_principal()
@@ -312,7 +456,7 @@ impl<P: Policy> Walker<'_, P> {
                 // The node of the top frame is gone. Whatever replaced it
                 // hangs from the frame before, so resume there. The starting
                 // frame is only ever the root, which survives.
-                if let Some(previous) = passed.pop() {
+                if let Some(previous) = self.passed.pop() {
                     top = previous;
                 }
                 continue;
@@ -367,42 +511,33 @@ impl<P: Policy> Walker<'_, P> {
                 (Kind::Eraser, _) => return Err(Halt::Malformed("the walk ran into an eraser")),
                 (Kind::Root, _) => return Err(Halt::Malformed("the walk came back to the root")),
             };
-            passed.push(std::mem::replace(&mut top, next));
+            self.passed.push(std::mem::replace(&mut top, next));
         };
-
-        let mut term = match head {
-            Head::Lam(node, name) => {
-                let name = self.policy.net().name(name).to_owned();
-                let context = top.context.enter_abstraction(self.binders.len());
-                self.binders.push(node);
-                let body = self.term(node.port(slot::BODY), context)?;
-                self.binders.pop();
-                Term::lam(name, body)
-            }
-            Head::Bound(node) => {
-                // A shared abstraction can occur inside a copy of itself, so
-                // the node alone does not say which copy binds the variable.
-                // The scope the walk is in does.
-                let binder = top
-                    .context
-                    .binder()
-                    .filter(|&binder| self.binders.get(binder) == Some(&node))
-                    .ok_or(Halt::Malformed("a variable occurs outside its binder"))?;
-                Term::Var(self.binders.len() - 1 - binder)
-            }
-            Head::Free(name) => Term::free(self.policy.net().name(name)),
-        };
-
-        // Unwind: every application passed on the way takes its argument.
-        passed.push(top);
-        for frame in passed.into_iter().skip(1).rev() {
+        // Nothing on this stretch will be rewritten any more, so only the
+        // applications are still of interest: each takes an argument once
+        // the head is done. Letting go of the fans and delimiters here is
+        // what keeps the memory of a walk in proportion to the term it has
+        // read, not to the length of the path it took.
+        let context = top.context.clone();
+        for frame in self.passed.drain(..).chain([top]) {
             let node = frame.exit.node;
             if frame.exit.is_principal() && self.policy.net().kind(node) == Kind::App {
-                let arg = self.term(node.port(slot::ARG), frame.context)?;
-                term = Term::app(term, arg);
+                pending.push(Pending::Argument(node, frame.context));
             }
         }
-        Ok(term)
+        Ok((head, context))
+    }
+
+    /// Pays for one node the walk comes to.
+    fn spend(&mut self) -> Result<(), Halt> {
+        self.fuel = self.fuel.checked_sub(1).ok_or(Halt::OutOfFuel)?;
+        if self.fuel.is_multiple_of(INTERRUPT_CHECK)
+            && let Some(interrupted) = self.interrupted
+            && interrupted()
+        {
+            return Err(Halt::Interrupted);
+        }
+        Ok(())
     }
 }
 
@@ -498,10 +633,81 @@ mod tests {
     fn divergence_runs_out_of_fuel_and_can_resume() {
         let mut machine = machine(r"(\x. x x) (\x. x x)");
         assert_eq!(machine.normalize(500), Err(Halt::OutOfFuel));
-        assert_eq!(machine.stats().interactions(), 500);
+        let first = machine.stats().interactions();
+        assert!(first > 100 && first <= 500, "{first}");
         assert_eq!(machine.normalize(500), Err(Halt::OutOfFuel));
-        assert_eq!(machine.stats().interactions(), 1_000);
+        assert!(machine.stats().interactions() > first);
         assert_eq!(machine.net().check(), Ok(()));
+    }
+
+    #[test]
+    fn fuel_bounds_the_reading_of_an_endless_result() {
+        // `fix f` unfolds to `f (f (f ...))`. Every unfolding takes a handful
+        // of interactions but a longer and longer way to reach, so it is the
+        // walk that has to be bounded, not the interactions alone.
+        let mut machine = machine(r"(\x. f (x x)) (\x. f (x x))");
+        assert_eq!(machine.normalize(2_000_000), Err(Halt::OutOfFuel));
+        assert!(machine.stats().interactions() < 100_000);
+    }
+
+    #[test]
+    fn fuel_bounds_the_size_of_the_result() {
+        // Four nested doublings: 4 beta-steps, and a result of 61 nodes.
+        let source = r"(\x. f x x) ((\x. f x x) ((\x. f x x) ((\x. f x x) a)))";
+        assert_eq!(machine(source).normalize(60), Err(Halt::OutOfFuel));
+        assert_eq!(machine(source).normalize(1_000).unwrap().size(), 61);
+    }
+
+    #[test]
+    fn deep_results_need_no_deep_stack() {
+        // A numeral of 65,536 nested applications, read, compared, measured
+        // and dropped on the small stack of a test thread.
+        let mut machine = machine("2 2 2 2");
+        let term = machine.normalize(10_000_000).unwrap();
+        assert_eq!(term.as_church(), Some(65_536));
+        assert_eq!(term, Term::church(65_536));
+        assert_eq!(term.size(), 2 * 65_536 + 3);
+    }
+
+    #[test]
+    fn an_interrupted_walk_stops_and_can_resume() {
+        let mut machine = machine("2 2 2 2");
+        assert_eq!(
+            machine.normalize_unless(10_000_000, &|| true),
+            Err(Halt::Interrupted)
+        );
+        assert_eq!(machine.net().check(), Ok(()));
+        let term = machine.normalize(10_000_000).unwrap();
+        assert_eq!(term.as_church(), Some(65_536));
+    }
+
+    #[test]
+    fn advancing_stops_after_a_beta() {
+        let source = r"(\f. f (f (\x. x))) (\g. g (\y. y))";
+        let mut direct = machine(source);
+        let expected = direct.normalize(1_000_000).unwrap();
+        let mut stepped = machine(source);
+        let mut betas = 0;
+        while let Some(rule) = stepped.advance(u64::MAX, true).unwrap() {
+            // Only the last stretch, to the normal form, may end without one.
+            if rule == Rule::Beta {
+                betas += 1;
+                assert_eq!(stepped.stats().beta, betas);
+            }
+        }
+        assert_eq!(stepped.stats(), direct.stats());
+        assert_eq!(stepped.readback(), Ok(expected));
+        // A limit on the interactions is kept as well.
+        let mut limited = machine(source);
+        assert!(limited.advance(3, false).unwrap().is_some());
+        assert_eq!(limited.stats().interactions(), 3);
+    }
+
+    #[test]
+    fn reading_back_can_be_bounded() {
+        let machine = machine(r"\f x. f (f (f x))");
+        assert_eq!(machine.readback_within(3), Ok(None));
+        assert_eq!(machine.readback_within(100), Ok(Some(Term::church(3))));
     }
 
     #[test]

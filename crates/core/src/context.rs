@@ -149,37 +149,48 @@ impl Context {
     }
 
     /// Closes the scope at this level and suspends it in the one around.
-    pub fn leave_scope(&self, level: u32) -> Context {
-        let (inner, rest) = self.split(level);
-        let (scope, rest) = rest.pop().unwrap_or_default();
-        let (mut around, rest) = rest.pop().unwrap_or_default();
-        around.suspended = around.suspended.push(scope);
-        Context::join(inner, rest.push(around))
+    #[cfg(test)]
+    fn leave_scope(&self, level: u32) -> Context {
+        self.leave_scopes(level, 1)
     }
 
     /// Closes `count` scopes in a row at this level, as a stack of that many
     /// delimiters does.
+    ///
+    /// The scopes inside the level are set aside once for the whole stack,
+    /// so the cost is the level plus the count, not their product.
     pub fn leave_scopes(&self, level: u32, count: u32) -> Context {
-        (0..count).fold(self.clone(), |context, _| context.leave_scope(level))
+        let (inner, mut rest) = self.split(level);
+        for _ in 0..count {
+            let (scope, outer) = rest.pop().unwrap_or_default();
+            let (mut around, outer) = outer.pop().unwrap_or_default();
+            around.suspended = around.suspended.push(scope);
+            rest = outer.push(around);
+        }
+        Context::join(inner, rest)
+    }
+
+    /// Reopens at this level the scope suspended last, or a fresh one.
+    #[cfg(test)]
+    fn enter_scope(&self, level: u32) -> Context {
+        self.enter_scopes(level, 1)
     }
 
     /// Reopens `count` scopes in a row at this level.
     pub fn enter_scopes(&self, level: u32, count: u32) -> Context {
-        (0..count).fold(self.clone(), |context, _| context.enter_scope(level))
-    }
-
-    /// Reopens at this level the scope suspended last, or a fresh one.
-    pub fn enter_scope(&self, level: u32) -> Context {
-        let (inner, rest) = self.split(level);
-        let (mut around, rest) = rest.pop().unwrap_or_default();
-        let scope = match around.suspended.pop() {
-            Some((scope, suspended)) => {
-                around.suspended = suspended;
-                scope
-            }
-            None => Scope::default(),
-        };
-        Context::join(inner, rest.push(around).push(scope))
+        let (inner, mut rest) = self.split(level);
+        for _ in 0..count {
+            let (mut around, outer) = rest.pop().unwrap_or_default();
+            let scope = match around.suspended.pop() {
+                Some((scope, suspended)) => {
+                    around.suspended = suspended;
+                    scope
+                }
+                None => Scope::default(),
+            };
+            rest = outer.push(around).push(scope);
+        }
+        Context::join(inner, rest)
     }
 }
 
