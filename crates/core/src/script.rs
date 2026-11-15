@@ -9,44 +9,55 @@
 //! are expanded when a term is parsed, so they cannot refer to themselves:
 //! recursion needs a fixed-point combinator.
 
+use std::collections::HashMap;
+
 use crate::parse::{ParseError, is_name, parse_with};
 use crate::term::Term;
 
 /// One statement of a script.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Statement {
+    /// `name = term`: the name stands for the term from here on.
     Define(String, Term),
+    /// A term to reduce.
     Evaluate(Term),
 }
 
 /// The names defined so far.
 #[derive(Clone, Debug, Default)]
 pub struct Definitions {
+    /// In the order the names were first defined.
     entries: Vec<(String, Term)>,
+    /// Where each name is in `entries`.
+    index: HashMap<String, usize>,
 }
 
 impl Definitions {
+    /// No definitions.
     pub fn new() -> Definitions {
         Definitions::default()
     }
 
+    /// The term `name` stands for, if it is defined.
     pub fn get(&self, name: &str) -> Option<&Term> {
-        self.entries
-            .iter()
-            .find(|(defined, _)| defined == name)
-            .map(|(_, term)| term)
+        self.index.get(name).map(|&at| &self.entries[at].1)
     }
 
     /// Defines `name`, replacing any earlier definition of it.
+    ///
+    /// The term must be closed, as the terms [`statement`] gives are: a de
+    /// Bruijn index that points out of it would be captured where the name
+    /// is used.
+    ///
+    /// [`statement`]: Definitions::statement
     pub fn define(&mut self, name: impl Into<String>, term: Term) {
         let name = name.into();
-        match self
-            .entries
-            .iter_mut()
-            .find(|(defined, _)| *defined == name)
-        {
-            Some(entry) => entry.1 = term,
-            None => self.entries.push((name, term)),
+        match self.index.get(&name) {
+            Some(&at) => self.entries[at].1 = term,
+            None => {
+                self.index.insert(name.clone(), self.entries.len());
+                self.entries.push((name, term));
+            }
         }
     }
 
@@ -57,10 +68,12 @@ impl Definitions {
             .map(|(name, term)| (name.as_str(), term))
     }
 
+    /// The number of names defined.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether nothing is defined.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -83,7 +96,7 @@ impl Definitions {
         let name = code[..sign].trim();
         if !is_name(name) {
             return Err(ParseError {
-                offset: 0,
+                offset: code.len() - code.trim_start().len(),
                 message: format!("expected a name before `=`, found `{name}`"),
             });
         }
@@ -117,13 +130,15 @@ fn blank_comments(source: &str) -> String {
 /// starts on, counting from 1.
 ///
 /// A statement starts on a line that begins in the first column and runs over
-/// the indented and empty lines that follow.
+/// the indented lines, the empty lines and the lines holding only a comment
+/// that follow.
 pub fn statements(script: &str) -> Vec<(usize, &str)> {
     let mut found: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
     let mut offset = 0;
     for (number, line) in script.split_inclusive('\n').enumerate() {
         let end = offset + line.len();
-        let continues = line.starts_with([' ', '\t']) || line.trim().is_empty();
+        let code = line.trim();
+        let continues = line.starts_with([' ', '\t']) || code.is_empty() || code.starts_with("--");
         match found.last_mut() {
             Some((_, range)) if continues => range.end = end,
             _ => found.push((number + 1, offset..end)),
@@ -189,6 +204,38 @@ mod tests {
         assert_eq!(error.offset, 14);
         assert!(definitions.statement("a b = c").is_err());
         assert!(definitions.statement("= c").is_err());
+        assert_eq!(definitions.statement("\n  1x = c").unwrap_err().offset, 3);
+    }
+
+    #[test]
+    fn a_comment_does_not_end_a_statement() {
+        let script = "two = \\f x.\n-- twice\n  f (f x)\n-- and now\nthree = 3\n";
+        let found = statements(script);
+        let lines: Vec<usize> = found.iter().map(|(line, _)| *line).collect();
+        assert_eq!(lines, [1, 5]);
+        let definitions = Definitions::new();
+        assert_eq!(
+            definitions.statement(found[0].1),
+            Ok(Some(Statement::Define("two".to_owned(), Term::church(2))))
+        );
+        // A comment before the first statement stands alone.
+        assert_eq!(statements("-- intro\nx\n").len(), 2);
+    }
+
+    #[test]
+    fn long_chains_of_definitions_stay_small() {
+        // Each name uses the one before twice. Expanded as trees these would
+        // be 2^60 nodes, but the uses share one term.
+        let mut definitions = Definitions::new();
+        definitions.define("d0", Term::lam("x", Term::Var(0)));
+        for n in 1..=60 {
+            let source = format!("d{n} = d{} d{}", n - 1, n - 1);
+            let Ok(Some(Statement::Define(name, term))) = definitions.statement(&source) else {
+                panic!("expected a definition");
+            };
+            definitions.define(name, term);
+        }
+        assert_eq!(definitions.len(), 61);
     }
 
     #[test]

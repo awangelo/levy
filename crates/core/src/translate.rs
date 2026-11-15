@@ -41,48 +41,69 @@ struct Builder {
     occurrences: Vec<Vec<Port>>,
 }
 
+/// What is left to build.
+enum Job<'a> {
+    /// Build this term and attach it to this port.
+    Build(&'a Term, Port),
+    /// The body of an abstraction is built: wire up this variable port.
+    Bind(Port),
+}
+
 impl Builder {
     /// Builds `term` and attaches it to `parent`.
+    ///
+    /// A term can be nested deeper than any call stack, so the work left is
+    /// kept in a list, not in recursive calls.
     fn build(&mut self, term: &Term, parent: Port) -> Result<(), UnboundIndex> {
-        match term {
-            Term::Var(index) => {
-                let binder = self
-                    .occurrences
-                    .len()
-                    .checked_sub(index + 1)
-                    .ok_or(UnboundIndex(*index))?;
-                let crossed = u32::try_from(*index).map_err(|_| UnboundIndex(*index))?;
-                let port = if crossed == 0 {
-                    parent
-                } else {
-                    let delimiter = self.net.add(Kind::Delim {
-                        level: 0,
-                        count: crossed,
-                    });
-                    self.net.link(delimiter.port(slot::INSIDE), parent);
-                    delimiter.principal()
-                };
-                self.occurrences[binder].push(port);
-            }
-            Term::Free(name) => {
-                let name = self.net.intern(name);
-                let free = self.net.add(Kind::Free { name });
-                self.net.link(free.principal(), parent);
-            }
-            Term::Lam(name, body) => {
-                let name = self.net.intern(name);
-                let lam = self.net.add(Kind::Lam { name });
-                self.net.link(lam.principal(), parent);
-                self.occurrences.push(Vec::new());
-                self.build(body, lam.port(slot::BODY))?;
-                let occurrences = self.occurrences.pop().unwrap_or_default();
-                self.share(lam.port(slot::VAR), &occurrences);
-            }
-            Term::App(func, arg) => {
-                let app = self.net.add(Kind::App);
-                self.net.link(app.port(slot::RESULT), parent);
-                self.build(func, app.principal())?;
-                self.build(arg, app.port(slot::ARG))?;
+        let mut jobs = vec![Job::Build(term, parent)];
+        while let Some(job) = jobs.pop() {
+            let (term, parent) = match job {
+                Job::Build(term, parent) => (term, parent),
+                Job::Bind(variable) => {
+                    let occurrences = self.occurrences.pop().unwrap_or_default();
+                    self.share(variable, &occurrences);
+                    continue;
+                }
+            };
+            match term {
+                Term::Var(index) => {
+                    let binder = index
+                        .checked_add(1)
+                        .and_then(|above| self.occurrences.len().checked_sub(above))
+                        .ok_or(UnboundIndex(*index))?;
+                    let crossed = u32::try_from(*index).map_err(|_| UnboundIndex(*index))?;
+                    let port = if crossed == 0 {
+                        parent
+                    } else {
+                        let delimiter = self.net.add(Kind::Delim {
+                            level: 0,
+                            count: crossed,
+                        });
+                        self.net.link(delimiter.port(slot::INSIDE), parent);
+                        delimiter.principal()
+                    };
+                    self.occurrences[binder].push(port);
+                }
+                Term::Free(name) => {
+                    let name = self.net.intern(name);
+                    let free = self.net.add(Kind::Free { name });
+                    self.net.link(free.principal(), parent);
+                }
+                Term::Lam(name, body) => {
+                    let name = self.net.intern(name);
+                    let lam = self.net.add(Kind::Lam { name });
+                    self.net.link(lam.principal(), parent);
+                    self.occurrences.push(Vec::new());
+                    jobs.push(Job::Bind(lam.port(slot::VAR)));
+                    jobs.push(Job::Build(body, lam.port(slot::BODY)));
+                }
+                Term::App(func, arg) => {
+                    let app = self.net.add(Kind::App);
+                    self.net.link(app.port(slot::RESULT), parent);
+                    // The function is built first, as it is read first.
+                    jobs.push(Job::Build(arg, app.port(slot::ARG)));
+                    jobs.push(Job::Build(func, app.principal()));
+                }
             }
         }
         Ok(())
@@ -192,5 +213,15 @@ mod tests {
         assert_eq!(translate(&Term::Var(0)).unwrap_err(), UnboundIndex(0));
         let term = Term::lam("x", Term::Var(2));
         assert_eq!(translate(&term).unwrap_err(), UnboundIndex(2));
+        let term = Term::lam("x", Term::Var(usize::MAX));
+        assert_eq!(translate(&term).unwrap_err(), UnboundIndex(usize::MAX));
+    }
+
+    #[test]
+    fn deep_terms_need_no_deep_stack() {
+        let net = translate(&Term::church(200_000)).unwrap();
+        assert_eq!(net.check(), Ok(()));
+        // Two abstractions, the applications, and the fans that share `f`.
+        assert_eq!(census(&net)[..3], [2, 200_000, 199_999]);
     }
 }

@@ -21,6 +21,7 @@ use crate::term::Term;
 /// What the reference reducer found.
 #[derive(Clone, Debug)]
 pub struct Outcome {
+    /// The term with no redex left.
     pub normal_form: Term,
     /// β-steps taken by normal-order reduction.
     pub beta_steps: u64,
@@ -43,7 +44,8 @@ impl std::error::Error for BudgetExhausted {}
 /// Reduces `term` to normal form in normal order.
 ///
 /// `budget` bounds the work: each β-step costs one unit, and so does each
-/// node copied by a substitution.
+/// node copied by a substitution. That bounds the memory as well, and since
+/// nothing here recurses on the shape of a term, the stack is no limit.
 pub fn normalize(term: &Term, budget: u64) -> Result<Outcome, BudgetExhausted> {
     let mut reducer = Reducer {
         budget,
@@ -142,31 +144,161 @@ enum Shape {
     App(Box<Labelled>, Box<Labelled>),
 }
 
+impl Shape {
+    /// Takes the shape out, leaving a leaf in its place.
+    fn take(&mut self) -> Shape {
+        std::mem::replace(self, Shape::Var(0))
+    }
+}
+
+impl Drop for Labelled {
+    /// Takes the term apart with a worklist, so that dropping a deep term
+    /// cannot overflow the call stack.
+    fn drop(&mut self) {
+        let mut pending: Vec<Box<Labelled>> = Vec::new();
+        let mut shape = self.shape.take();
+        loop {
+            match shape {
+                Shape::Var(_) | Shape::Free(_) => {}
+                Shape::Lam(_, body) => pending.push(body),
+                Shape::App(func, arg) => {
+                    pending.push(func);
+                    pending.push(arg);
+                }
+            }
+            match pending.pop() {
+                Some(mut node) => shape = node.shape.take(),
+                None => return,
+            }
+        }
+    }
+}
+
+/// What a node turns out to be when a rebuilding pass looks at it.
+enum Opened<N, R, L, A> {
+    /// A finished result.
+    Leaf(R),
+    /// An abstraction: rebuild the body, then close it with the note.
+    Lam(L, N),
+    /// An application: rebuild function and argument, then join them.
+    App(A, N, N),
+}
+
+/// Rebuilds a tree from the leaves up, without recursion.
+///
+/// `open` looks at one node, function sides first, and says what is to be
+/// rebuilt below it. `lam` and `app` put the rebuilt parts together.
+fn rebuild<N, R, L, A, E>(
+    root: N,
+    mut open: impl FnMut(N) -> Result<Opened<N, R, L, A>, E>,
+    lam: impl Fn(L, R) -> R,
+    app: impl Fn(A, R, R) -> R,
+) -> Result<R, E> {
+    enum Step<N, L, A> {
+        Open(N),
+        Lam(L),
+        App(A),
+    }
+    const BALANCED: &str = "every step finds the results it waits for";
+    let mut steps = vec![Step::Open(root)];
+    let mut done: Vec<R> = Vec::new();
+    while let Some(step) = steps.pop() {
+        match step {
+            Step::Open(node) => match open(node)? {
+                Opened::Leaf(result) => done.push(result),
+                Opened::Lam(note, body) => {
+                    steps.push(Step::Lam(note));
+                    steps.push(Step::Open(body));
+                }
+                Opened::App(note, func, arg) => {
+                    steps.push(Step::App(note));
+                    steps.push(Step::Open(arg));
+                    steps.push(Step::Open(func));
+                }
+            },
+            Step::Lam(note) => {
+                let body = done.pop().expect(BALANCED);
+                done.push(lam(note, body));
+            }
+            Step::App(note) => {
+                let arg = done.pop().expect(BALANCED);
+                let func = done.pop().expect(BALANCED);
+                done.push(app(note, func, arg));
+            }
+        }
+    }
+    Ok(done.pop().expect(BALANCED))
+}
+
 impl Labelled {
+    fn lam((label, name): (Label, Rc<str>), body: Labelled) -> Labelled {
+        Labelled {
+            label,
+            shape: Shape::Lam(name, Box::new(body)),
+        }
+    }
+
+    fn app(label: Label, func: Labelled, arg: Labelled) -> Labelled {
+        Labelled {
+            label,
+            shape: Shape::App(Box::new(func), Box::new(arg)),
+        }
+    }
+
+    /// The label and the shape, separately.
+    fn into_parts(mut self) -> (Label, Shape) {
+        (self.label, self.shape.take())
+    }
+
+    /// Labels every subterm with an atom of its own.
     fn from_term(term: &Term, next_atom: &mut u64) -> Labelled {
-        let label = Label::atom(*next_atom);
-        *next_atom += 1;
-        let shape = match term {
-            Term::Var(index) => Shape::Var(*index),
-            Term::Free(name) => Shape::Free(name.as_str().into()),
-            Term::Lam(name, body) => Shape::Lam(
-                name.as_str().into(),
-                Box::new(Labelled::from_term(body, next_atom)),
-            ),
-            Term::App(func, arg) => Shape::App(
-                Box::new(Labelled::from_term(func, next_atom)),
-                Box::new(Labelled::from_term(arg, next_atom)),
-            ),
-        };
-        Labelled { label, shape }
+        let result: Result<Labelled, std::convert::Infallible> = rebuild(
+            term,
+            |term| {
+                let label = Label::atom(*next_atom);
+                *next_atom += 1;
+                Ok(match term {
+                    Term::Var(index) => Opened::Leaf(Labelled {
+                        label,
+                        shape: Shape::Var(*index),
+                    }),
+                    Term::Free(name) => Opened::Leaf(Labelled {
+                        label,
+                        shape: Shape::Free(name.as_str().into()),
+                    }),
+                    Term::Lam(name, body) => {
+                        Opened::Lam((label, name.as_str().into()), body.as_ref())
+                    }
+                    Term::App(func, arg) => Opened::App(label, func.as_ref(), arg.as_ref()),
+                })
+            },
+            Labelled::lam,
+            Labelled::app,
+        );
+        match result {
+            Ok(labelled) => labelled,
+            Err(never) => match never {},
+        }
     }
 
     fn into_term(self) -> Term {
-        match self.shape {
-            Shape::Var(index) => Term::Var(index),
-            Shape::Free(name) => Term::Free(name.as_ref().to_owned()),
-            Shape::Lam(name, body) => Term::lam(name.as_ref(), body.into_term()),
-            Shape::App(func, arg) => Term::app(func.into_term(), arg.into_term()),
+        let open = |node: Labelled| {
+            Ok(match node.into_parts().1 {
+                Shape::Var(index) => Opened::Leaf(Term::Var(index)),
+                Shape::Free(name) => Opened::Leaf(Term::Free(name.as_ref().to_owned())),
+                Shape::Lam(name, body) => Opened::Lam(name, *body),
+                Shape::App(func, arg) => Opened::App((), *func, *arg),
+            })
+        };
+        let result: Result<Term, std::convert::Infallible> = rebuild(
+            self,
+            open,
+            |name: Rc<str>, body| Term::lam(name.as_ref(), body),
+            |(), func, arg| Term::app(func, arg),
+        );
+        match result {
+            Ok(term) => term,
+            Err(never) => match never {},
         }
     }
 }
@@ -184,17 +316,15 @@ impl Reducer {
     }
 
     fn normalize(&mut self, term: Labelled) -> Result<Labelled, BudgetExhausted> {
-        let Labelled { label, shape } = self.head_normalize(term)?;
-        let shape = match shape {
-            Shape::Lam(name, body) => Shape::Lam(name, Box::new(self.normalize(*body)?)),
-            Shape::App(func, arg) => {
-                let func = self.normalize(*func)?;
-                let arg = self.normalize(*arg)?;
-                Shape::App(Box::new(func), Box::new(arg))
-            }
-            leaf => leaf,
+        let open = |node: Labelled| {
+            let (label, shape) = self.head_normalize(node)?.into_parts();
+            Ok(match shape {
+                Shape::Lam(name, body) => Opened::Lam((label, name), *body),
+                Shape::App(func, arg) => Opened::App(label, *func, *arg),
+                leaf => Opened::Leaf(Labelled { label, shape: leaf }),
+            })
         };
-        Ok(Labelled { label, shape })
+        rebuild(term, open, Labelled::lam, Labelled::app)
     }
 
     /// Contracts head redexes until the term is an abstraction or is stuck on
@@ -204,30 +334,30 @@ impl Reducer {
         // and its argument.
         let mut spine: Vec<(Label, Box<Labelled>)> = Vec::new();
         let mut head = term;
-        loop {
-            head = match head.shape {
+        let head = loop {
+            let (label, shape) = head.into_parts();
+            head = match shape {
                 Shape::App(func, arg) => {
-                    spine.push((head.label, arg));
+                    spine.push((label, arg));
                     *func
                 }
                 Shape::Lam(name, body) => {
-                    let Some((label, arg)) = spine.pop() else {
-                        head.shape = Shape::Lam(name, body);
-                        break;
+                    let Some((outer, arg)) = spine.pop() else {
+                        break Labelled {
+                            label,
+                            shape: Shape::Lam(name, body),
+                        };
                     };
                     self.spend()?;
                     self.beta_steps += 1;
-                    self.degrees.insert(head.label);
-                    let mut result = self.substitute(*body, 0, &arg, head.label.underlined())?;
-                    result.label = label.then(head.label.overlined()).then(result.label);
+                    self.degrees.insert(label);
+                    let mut result = self.substitute(*body, &arg, label.underlined())?;
+                    result.label = outer.then(label.overlined()).then(result.label);
                     result
                 }
-                leaf => {
-                    head.shape = leaf;
-                    break;
-                }
+                leaf => break Labelled { label, shape: leaf },
             };
-        }
+        };
         Ok(spine
             .into_iter()
             .rev()
@@ -237,64 +367,71 @@ impl Reducer {
             }))
     }
 
-    /// Replaces the variable bound `depth` binders up by `arg`, whose label
-    /// gets `mark` in front at every occurrence.
+    /// Replaces the variable bound by the binder just outside `target` by
+    /// `arg`, whose label gets `mark` in front at every occurrence.
     fn substitute(
         &mut self,
         target: Labelled,
-        depth: usize,
         arg: &Labelled,
         mark: Label,
     ) -> Result<Labelled, BudgetExhausted> {
-        let Labelled { label, shape } = target;
-        let shape = match shape {
-            Shape::Var(index) if index == depth => {
-                let copy = self.lifted(arg, depth, 0)?;
-                return Ok(Labelled {
-                    label: label.then(mark).then(copy.label),
-                    shape: copy.shape,
-                });
-            }
-            Shape::Var(index) if index > depth => Shape::Var(index - 1),
-            Shape::Lam(name, body) => Shape::Lam(
-                name,
-                Box::new(self.substitute(*body, depth + 1, arg, mark)?),
-            ),
-            Shape::App(func, operand) => {
-                let func = self.substitute(*func, depth, arg, mark)?;
-                let operand = self.substitute(*operand, depth, arg, mark)?;
-                Shape::App(Box::new(func), Box::new(operand))
-            }
-            leaf => leaf,
+        // Each node goes with the number of binders between it and the top.
+        let open = |(node, depth): (Labelled, usize)| {
+            let (label, shape) = node.into_parts();
+            let shape = match shape {
+                Shape::Var(index) if index == depth => {
+                    let (copied, shape) = self.lifted(arg, depth)?.into_parts();
+                    return Ok(Opened::Leaf(Labelled {
+                        label: label.then(mark).then(copied),
+                        shape,
+                    }));
+                }
+                Shape::Var(index) if index > depth => Shape::Var(index - 1),
+                Shape::Lam(name, body) => {
+                    return Ok(Opened::Lam((label, name), (*body, depth + 1)));
+                }
+                Shape::App(func, operand) => {
+                    return Ok(Opened::App(label, (*func, depth), (*operand, depth)));
+                }
+                leaf => leaf,
+            };
+            Ok(Opened::Leaf(Labelled { label, shape }))
         };
-        Ok(Labelled { label, shape })
+        rebuild((target, 0), open, Labelled::lam, Labelled::app)
     }
 
-    /// Copies `term`, raising by `by` the variables that point `cutoff` or
-    /// more binders up.
-    fn lifted(
-        &mut self,
-        term: &Labelled,
-        by: usize,
-        cutoff: usize,
-    ) -> Result<Labelled, BudgetExhausted> {
-        self.spend()?;
-        let shape = match &term.shape {
-            Shape::Var(index) if *index >= cutoff => Shape::Var(index + by),
-            Shape::Var(index) => Shape::Var(*index),
-            Shape::Free(name) => Shape::Free(name.clone()),
-            Shape::Lam(name, body) => {
-                Shape::Lam(name.clone(), Box::new(self.lifted(body, by, cutoff + 1)?))
-            }
-            Shape::App(func, arg) => Shape::App(
-                Box::new(self.lifted(func, by, cutoff)?),
-                Box::new(self.lifted(arg, by, cutoff)?),
-            ),
-        };
-        Ok(Labelled {
-            label: term.label,
-            shape,
-        })
+    /// Copies `term`, raising by `by` the variables that point out of it.
+    fn lifted(&mut self, term: &Labelled, by: usize) -> Result<Labelled, BudgetExhausted> {
+        // Each node goes with the number of binders between it and the top:
+        // a variable that points at least that far up points out.
+        rebuild(
+            (term, 0),
+            |(node, cutoff): (&Labelled, usize)| {
+                self.spend()?;
+                let label = node.label;
+                let shape = match &node.shape {
+                    Shape::Var(index) if *index >= cutoff => Shape::Var(index.saturating_add(by)),
+                    Shape::Var(index) => Shape::Var(*index),
+                    Shape::Free(name) => Shape::Free(name.clone()),
+                    Shape::Lam(name, body) => {
+                        return Ok(Opened::Lam(
+                            (label, name.clone()),
+                            (body.as_ref(), cutoff + 1),
+                        ));
+                    }
+                    Shape::App(func, arg) => {
+                        return Ok(Opened::App(
+                            label,
+                            (func.as_ref(), cutoff),
+                            (arg.as_ref(), cutoff),
+                        ));
+                    }
+                };
+                Ok(Opened::Leaf(Labelled { label, shape }))
+            },
+            Labelled::lam,
+            Labelled::app,
+        )
     }
 }
 
@@ -357,6 +494,30 @@ mod tests {
         let outcome = run(r"f ((\x. x) a) ((\x. x) a)");
         assert_eq!(outcome.beta_steps, 2);
         assert_eq!(outcome.families, 2);
+    }
+
+    #[test]
+    fn deep_terms_need_no_deep_stack() {
+        // The argument is nested 100,000 deep: it is labelled, copied by a
+        // substitution, normalized, and turned back into a term.
+        let numeral = Term::church(100_000);
+        let term = Term::app(Term::lam("n", Term::Var(0)), numeral.clone());
+        let outcome = normalize(&term, 1_000_000).unwrap();
+        assert_eq!(outcome.normal_form, numeral);
+        assert_eq!(outcome.beta_steps, 1);
+        // One more binder is uncovered at every step, until the budget ends.
+        let deepening = parse(r"(\x y. x x) (\x y. x x)").unwrap();
+        assert_eq!(normalize(&deepening, 300_000).unwrap_err(), BudgetExhausted);
+    }
+
+    #[test]
+    fn dangling_indices_are_left_alone() {
+        let term = Term::app(
+            Term::lam("x", Term::lam("y", Term::Var(1))),
+            Term::Var(usize::MAX),
+        );
+        let outcome = normalize(&term, 1_000).unwrap();
+        assert_eq!(outcome.normal_form, Term::lam("y", Term::Var(usize::MAX)));
     }
 
     #[test]
