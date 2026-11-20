@@ -225,28 +225,22 @@ impl Drop for Term {
 
 impl PartialEq for Term {
     fn eq(&self, other: &Self) -> bool {
-        let mut pending: Vec<(&Term, &Term)> = Vec::new();
-        let mut pair = (self, other);
-        loop {
-            pair = match pair {
-                (Term::Lam(_, a), Term::Lam(_, b)) => (a, b),
+        let mut pending: Vec<(&Term, &Term)> = vec![(self, other)];
+        while let Some(pair) = pending.pop() {
+            match pair {
+                // A shared subterm is equal to itself, however large.
+                (a, b) if std::ptr::eq(a, b) => {}
+                (Term::Lam(_, a), Term::Lam(_, b)) => pending.push((a, b)),
                 (Term::App(f, a), Term::App(g, b)) => {
-                    if !Arc::ptr_eq(a, b) {
-                        pending.push((a, b));
-                    }
-                    (f, g)
+                    pending.push((a, b));
+                    pending.push((f, g));
                 }
-                (Term::Var(a), Term::Var(b)) if a == b => match pending.pop() {
-                    Some(next) => next,
-                    None => return true,
-                },
-                (Term::Free(a), Term::Free(b)) if a == b => match pending.pop() {
-                    Some(next) => next,
-                    None => return true,
-                },
+                (Term::Var(a), Term::Var(b)) if a == b => {}
+                (Term::Free(a), Term::Free(b)) if a == b => {}
                 _ => return false,
-            };
+            }
         }
+        true
     }
 }
 
