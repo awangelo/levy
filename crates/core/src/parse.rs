@@ -10,6 +10,7 @@
 //! A numeral stands for the corresponding Church numeral. `--` starts a
 //! comment that runs to the end of the line.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::term::Term;
@@ -52,6 +53,7 @@ pub fn parse_with(
         tokens: lex(source)?,
         position: 0,
         scope: Vec::new(),
+        bound: HashMap::new(),
         definition,
     };
     parser.term()
@@ -210,6 +212,10 @@ struct Parser<'a> {
     position: usize,
     /// Names of the enclosing binders, innermost last.
     scope: Vec<String>,
+    /// For each name, the places in `scope` of the binders that bind it,
+    /// innermost last. A name is looked up here, not searched for in
+    /// `scope`, which would take time in proportion to the depth.
+    bound: HashMap<String, Vec<usize>>,
     definition: &'a dyn Fn(&str) -> Option<Term>,
 }
 
@@ -276,12 +282,7 @@ impl Parser<'_> {
                             Enclosure::Source => {
                                 return Err(self.error(format!("unexpected {token}")));
                             }
-                            Enclosure::Abstraction(depth) => self
-                                .scope
-                                .split_off(depth)
-                                .into_iter()
-                                .rev()
-                                .fold(term, |body, name| Term::lam(name, body)),
+                            Enclosure::Abstraction(depth) => self.close(depth, term),
                             Enclosure::Parentheses if token == Token::Close => {
                                 self.advance();
                                 term
@@ -309,6 +310,10 @@ impl Parser<'_> {
         let depth = self.scope.len();
         while let Token::Name(name) = self.peek() {
             let name = name.clone();
+            self.bound
+                .entry(name.clone())
+                .or_default()
+                .push(self.scope.len());
             self.scope.push(name);
             self.advance();
         }
@@ -322,9 +327,24 @@ impl Parser<'_> {
         Ok(depth)
     }
 
+    /// Closes the binders brought into scope beyond the first `depth` around
+    /// `body`, the innermost first.
+    fn close(&mut self, depth: usize, body: Term) -> Term {
+        let names = self.scope.split_off(depth);
+        for name in &names {
+            if let Some(places) = self.bound.get_mut(name) {
+                places.pop();
+            }
+        }
+        names
+            .into_iter()
+            .rev()
+            .fold(body, |body, name| Term::lam(name, body))
+    }
+
     fn resolve(&self, name: String) -> Term {
-        if let Some(index) = self.scope.iter().rev().position(|bound| *bound == name) {
-            Term::Var(index)
+        if let Some(&place) = self.bound.get(&name).and_then(|places| places.last()) {
+            Term::Var(self.scope.len() - 1 - place)
         } else if let Some(term) = (self.definition)(&name) {
             term
         } else {
@@ -360,6 +380,23 @@ mod tests {
     fn inner_binders_shadow_outer_ones() {
         let term = parse(r"\x. \x. x").unwrap();
         assert_eq!(term, Term::lam("x", Term::lam("x", Term::Var(0))));
+        // Out of its abstraction, a name is free again.
+        let term = parse(r"(\x. \x y. x) x").unwrap();
+        let inner = Term::lam("x", Term::lam("y", Term::Var(1)));
+        assert_eq!(term, Term::app(Term::lam("x", inner), Term::free("x")));
+    }
+
+    #[test]
+    fn names_are_found_however_deep_their_binder() {
+        // An outer binder used many times under many binders of another
+        // name. Searching the scope at every use would take minutes.
+        let depth = 100_000;
+        let source = format!(r"\a. {}{}", r"\x. ".repeat(depth), "a ".repeat(depth));
+        let uses = (1..depth).fold(Term::Var(depth), |func, _| {
+            Term::app(func, Term::Var(depth))
+        });
+        let body = (0..depth).fold(uses, |body, _| Term::lam("x", body));
+        assert_eq!(parse(&source).unwrap(), Term::lam("a", body));
     }
 
     #[test]
