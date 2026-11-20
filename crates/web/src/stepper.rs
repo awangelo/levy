@@ -4,6 +4,7 @@
 use std::collections::VecDeque;
 
 use levy_core::net::{Kind, Net, NodeId};
+use levy_core::term::Nodes;
 use levy_core::{Definitions, Halt, Machine, Rule};
 use serde::Serialize;
 
@@ -166,10 +167,10 @@ impl Stepper {
         let term = terms.last().ok_or("the script has no term to reduce")?;
         let size = term.size();
         if size > LARGEST_TERM {
-            let more = if size == usize::MAX { " or more" } else { "" };
             return Err(format!(
-                "the term has {size}{more} nodes with its definitions expanded, \
-                 more than the {LARGEST_TERM} the page takes"
+                "the term has {} with its definitions expanded, \
+                 more than the {LARGEST_TERM} the page takes",
+                Nodes(size)
             ));
         }
         let mut machine = Machine::new(term).map_err(|error| error.to_string())?;

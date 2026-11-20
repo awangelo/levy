@@ -113,8 +113,10 @@ impl Term {
     /// nodes and so would be too long to be worth reading.
     pub fn abbreviated(&self, limit: usize) -> String {
         match self.size() {
-            usize::MAX => format!("<a term of {} nodes or more>", usize::MAX),
-            size if size > limit => format!("<a term of {size} nodes>"),
+            // `usize::MAX` may stand for more, which no limit allows.
+            size if size > limit || size == usize::MAX => {
+                format!("<a term of {}>", Nodes(size))
+            }
             _ => self.to_string(),
         }
     }
@@ -167,6 +169,21 @@ impl Term {
                 take(arg);
             }
         }
+    }
+}
+
+/// A number of nodes as [`Term::size`] counts them, ready to be shown:
+/// `usize::MAX` stands for that many or more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Nodes(pub usize);
+
+impl fmt::Display for Nodes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} nodes", self.0)?;
+        if self.0 == usize::MAX {
+            f.write_str(" or more")?;
+        }
+        Ok(())
     }
 }
 

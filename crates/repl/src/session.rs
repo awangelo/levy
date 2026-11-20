@@ -8,6 +8,7 @@ use levy_core::dot::to_dot;
 use levy_core::parse::{MAX_NUMERAL, position};
 use levy_core::reference::{self, GaveUp};
 use levy_core::script::statements;
+use levy_core::term::Nodes;
 use levy_core::translate::translate;
 use levy_core::{Definitions, Halt, Machine, ParseError, Rule, ScriptError, Statement, Term};
 
@@ -375,10 +376,10 @@ impl Session {
         if u64::try_from(size).is_ok_and(|size| size <= self.fuel) {
             return Ok(());
         }
-        let more = if size == usize::MAX { " or more" } else { "" };
         let message = format!(
-            "error: the term has {size}{more} nodes with its definitions expanded, \
+            "error: the term has {} with its definitions expanded, \
              more than the limit of {} steps; raise it with `:fuel`",
+            Nodes(size),
             self.fuel
         );
         fail(out, &message)
