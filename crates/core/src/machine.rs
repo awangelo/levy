@@ -229,9 +229,9 @@ impl Machine {
     ) -> Result<Term, Halt> {
         if self.is_normal() {
             // There is nothing left to rewrite, only the result to read.
-            return read(&self.net, fuel, Some(interrupted));
+            return read(&self.net, fuel, interrupted);
         }
-        let (outcome, _) = self.reduce(u64::MAX, false, fuel, None, Some(interrupted));
+        let (outcome, _) = self.reduce(u64::MAX, false, fuel, None, interrupted);
         outcome.map_err(Stop::halt)
     }
 
@@ -270,6 +270,20 @@ impl Machine {
         until_beta: bool,
         fuel: u64,
     ) -> Result<Option<Rule>, Halt> {
+        self.advance_unless(interactions, until_beta, fuel, &|| false)
+    }
+
+    /// Like [`advance`](Machine::advance), but asks `interrupted` every
+    /// thousand units or so whether to give up. Once it says yes, the call
+    /// returns [`Halt::Interrupted`] if nothing has fired yet, and otherwise
+    /// the rule fired last, leaving the next call to stop at once.
+    pub fn advance_unless(
+        &mut self,
+        interactions: u64,
+        until_beta: bool,
+        fuel: u64,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Option<Rule>, Halt> {
         if self.is_normal() {
             return Ok(None);
         }
@@ -277,9 +291,11 @@ impl Machine {
         // fuel of that call and goes on with the rest. In a call it shares,
         // the walk has paid for the pair by the time it fires.
         let refill = Some(fuel.saturating_sub(1));
-        match self.reduce(interactions, until_beta, fuel, refill, None) {
+        match self.reduce(interactions, until_beta, fuel, refill, interrupted) {
             (Ok(_) | Err(Stop::Paused), last) => Ok(last),
-            (Err(Stop::Halt(Halt::OutOfFuel)), last @ Some(_)) => Ok(last),
+            // What fired is reported, and the walk is left on its way to the
+            // next pair, for a later call to take up.
+            (Err(Stop::Halt(Halt::OutOfFuel | Halt::Interrupted)), last @ Some(_)) => Ok(last),
             (Err(Stop::Halt(halt)), _) => Err(halt),
         }
     }
@@ -295,7 +311,7 @@ impl Machine {
         until_beta: bool,
         fuel: u64,
         refill: Option<u64>,
-        interrupted: Option<&dyn Fn() -> bool>,
+        interrupted: &dyn Fn() -> bool,
     ) -> (Result<Term, Stop>, Option<Rule>) {
         let state = match std::mem::replace(&mut self.progress, Progress::Idle) {
             Progress::Suspended(state) => *state,
@@ -363,7 +379,7 @@ impl Machine {
     /// more than `fuel` units of work, counted as in
     /// [`normalize`](Machine::normalize).
     pub fn readback_within(&self, fuel: u64) -> Result<Option<Term>, Halt> {
-        match read(&self.net, fuel, None) {
+        match read(&self.net, fuel, &|| false) {
             Ok(term) => Ok(Some(term)),
             Err(Halt::OutOfFuel) => Ok(None),
             Err(halt) => Err(halt),
@@ -382,7 +398,7 @@ impl Machine {
 
 /// Reads a net as a term without rewriting anything.
 pub fn readback(net: &Net) -> Result<Term, Halt> {
-    read(net, u64::MAX, None)
+    read(net, u64::MAX, &|| false)
 }
 
 /// What a walk does with the active pairs it comes across.
@@ -460,7 +476,7 @@ impl Policy for Reduce<'_> {
 
 /// Reads the term a net stands for from the root, without rewriting
 /// anything and spending at most `fuel`.
-fn read(net: &Net, fuel: u64, interrupted: Option<&dyn Fn() -> bool>) -> Result<Term, Halt> {
+fn read(net: &Net, fuel: u64, interrupted: &dyn Fn() -> bool) -> Result<Term, Halt> {
     let mut observe = Observe(net);
     let mut walker = Walker::new(&mut observe, Suspended::at_root(net), fuel, interrupted);
     walker.term().map_err(Stop::halt)
@@ -543,7 +559,7 @@ struct Walker<'a, P> {
     /// How much fuel the refills have added to what the walk started with.
     refilled: u64,
     /// Asked now and then whether to give up.
-    interrupted: Option<&'a dyn Fn() -> bool>,
+    interrupted: &'a dyn Fn() -> bool,
 }
 
 impl<'a, P: Policy> Walker<'a, P> {
@@ -552,7 +568,7 @@ impl<'a, P: Policy> Walker<'a, P> {
         policy: &'a mut P,
         state: Suspended,
         fuel: u64,
-        interrupted: Option<&'a dyn Fn() -> bool>,
+        interrupted: &'a dyn Fn() -> bool,
     ) -> Self {
         Walker {
             policy,
@@ -742,10 +758,7 @@ impl<'a, P: Policy> Walker<'a, P> {
 
     /// Pays for one node the walk comes to, unless it is to give up first.
     fn spend(&mut self) -> Result<(), Halt> {
-        if self.walked.is_multiple_of(crate::INTERRUPT_CHECK)
-            && let Some(interrupted) = self.interrupted
-            && interrupted()
-        {
+        if self.walked.is_multiple_of(crate::INTERRUPT_CHECK) && (self.interrupted)() {
             return Err(Halt::Interrupted);
         }
         self.fuel = self.fuel.checked_sub(1).ok_or(Halt::OutOfFuel)?;
@@ -756,6 +769,8 @@ impl<'a, P: Policy> Walker<'a, P> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     use crate::parse::parse;
 
@@ -1023,10 +1038,35 @@ mod tests {
         let mut machine = machine(r"(\x. x x) (\x. x x)");
         let fuel = 10 * crate::INTERRUPT_CHECK - 1;
         let interrupted = || true;
-        let (outcome, _) = machine.reduce(100_000, false, fuel, Some(fuel), Some(&interrupted));
+        let (outcome, _) = machine.reduce(100_000, false, fuel, Some(fuel), &interrupted);
         assert_eq!(outcome, Err(Stop::Halt(Halt::Interrupted)));
         assert!(machine.stats().interactions() < crate::INTERRUPT_CHECK);
         assert_eq!(machine.net().check(), Ok(()));
+    }
+
+    #[test]
+    fn an_interrupt_after_an_interaction_stops_the_next_call() {
+        let mut machine = machine("2 2 2 2");
+        // Asked at the start of the call, and then a thousand units in, by
+        // when interactions have fired.
+        let asked = Cell::new(0);
+        let late = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        };
+        let fired = machine.advance_unless(u64::MAX, false, u64::MAX, &late);
+        assert!(fired.unwrap().is_some());
+        assert_eq!(asked.get(), 2);
+        let stats = machine.stats();
+        // The next call stops before it fires anything.
+        assert_eq!(
+            machine.advance_unless(1, false, u64::MAX, &|| true),
+            Err(Halt::Interrupted)
+        );
+        assert_eq!(machine.stats(), stats);
+        // Nothing is lost.
+        let term = machine.normalize(10_000_000).unwrap();
+        assert_eq!(term.as_church(), Some(65_536));
     }
 
     #[test]

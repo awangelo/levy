@@ -21,9 +21,6 @@ const TRACE_LIMIT: u64 = 100;
 /// Work allowed for reading back one term of a trace. A term that takes
 /// more is too large to be worth printing.
 const TRACE_READ_FUEL: u64 = 40_000;
-/// Work `:trace` lets one interaction do between two looks at the interrupt
-/// flag.
-const TRACE_STRETCH: u64 = 1_000_000;
 
 /// Where the session writes.
 pub trait Output {
@@ -256,13 +253,10 @@ impl Session {
             if out.is_closed() {
                 return Ok(());
             }
-            if self.interrupted() {
-                break Some(Halt::Interrupted);
-            }
             // One interaction at a time, so that the fuel given bounds the
             // call, and all the calls together spend no more than the limit.
             let left = self.fuel.saturating_sub(machine.spent());
-            match machine.advance(1, false, left.min(TRACE_STRETCH)) {
+            match machine.advance_unless(1, false, left, &|| self.interrupted()) {
                 Ok(None) => break None,
                 Ok(Some(Rule::Beta)) => {
                     if shown == TRACE_LIMIT {
@@ -277,8 +271,6 @@ impl Session {
                     }
                 }
                 Ok(Some(_)) => {}
-                // Only the stretch is spent, not the limit.
-                Err(Halt::OutOfFuel) if left > TRACE_STRETCH => {}
                 Err(halt) => break Some(halt),
             }
         };
