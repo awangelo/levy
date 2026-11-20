@@ -70,11 +70,12 @@
         </div>
 
         <ul class="legend" aria-label="Legend">
-          <li><span class="swatch lam"></span>λ abstraction</li>
-          <li><span class="swatch app"></span>@ application</li>
-          <li><span class="swatch fan"></span>fan: shares a subterm</li>
-          <li><span class="swatch delim"></span>delimiter: border of a scope (×n: n stacked)</li>
-          <li><span class="swatch port"></span>principal port</li>
+          <!-- The shapes are the ones app.js draws in the net, at the same size. -->
+          <li><svg class="swatch lam" viewBox="-17 -17 34 34" aria-hidden="true"><circle r="15" /></svg>λ abstraction</li>
+          <li><svg class="swatch app" viewBox="-17 -17 34 34" aria-hidden="true"><circle r="15" /></svg>@ application</li>
+          <li><svg class="swatch fan" viewBox="-17 -20 34 34" aria-hidden="true"><path d="M0,-16 L15,10 L-15,10 Z" /></svg>fan: shares a subterm</li>
+          <li><svg class="swatch delim" viewBox="-17 -18 34 34" aria-hidden="true"><path d="M-14,6 A14,14 0 0 1 14,6 Z" /></svg>delimiter: border of a scope (×n: n stacked)</li>
+          <li><svg class="swatch port" viewBox="-17 -17 34 34" aria-hidden="true"><circle r="8" /></svg>principal port</li>
         </ul>
       </section>
     </main>
