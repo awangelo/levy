@@ -2,9 +2,9 @@
 // that come back. All of the reduction logic lives on the Rust side.
 
 const SVG = "http://www.w3.org/2000/svg";
-const COLUMN = 62; // horizontal distance between neighbouring leaves
-const ROW = 58; // vertical distance between a node and its children
-const MARGIN = 44;
+const COLUMN = 54; // horizontal distance between neighbouring leaves
+const ROW = 50; // vertical distance between a node and its children
+const MARGIN = 32;
 const MAX_DRAWN = 700; // nets with more nodes are not drawn
 const SLICE = 12; // milliseconds a run works before it lets the page breathe
 

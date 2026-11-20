@@ -48,26 +48,32 @@
   background: var(--selection);
 }
 
+/* Sizes are in rem, so the page follows the browser's default font size. The
+   page fills the window: the canvas takes whatever height the rest leaves. */
 body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  min-height: 100dvh;
   margin: 0;
   background: var(--page);
   color: var(--ink);
-  font: 13px/1.5 var(--mono);
+  font: 1rem/1.5 var(--mono);
 }
 
 header {
   display: flex;
   align-items: baseline;
-  gap: 16px;
+  gap: 20px;
   flex-wrap: wrap;
-  padding: 10px 16px;
+  padding: 12px 20px;
   background: var(--editor);
   border-bottom: 1px solid var(--line);
 }
 
 header h1 {
   margin: 0;
-  font: 18px/1 var(--mono);
+  font: 1.5rem/1 var(--mono);
   color: var(--keyword);
 }
 
@@ -77,15 +83,18 @@ header p {
 }
 
 main {
+  flex: 1 0 auto;
   display: grid;
-  grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
-  gap: 12px;
-  padding: 12px 16px 24px;
+  grid-template-columns: minmax(17rem, min(26rem, 30%)) minmax(0, 1fr);
+  gap: 16px;
+  padding: 16px 20px;
 }
 
+/* One column: the page scrolls, and the canvas takes most of a screen. */
 @media (max-width: 860px) {
   main {
     grid-template-columns: minmax(0, 1fr);
+    align-content: start;
   }
 }
 
@@ -93,7 +102,7 @@ section {
   background: var(--editor);
   border: 1px solid var(--line);
   border-radius: 6px;
-  padding: 12px;
+  padding: 16px;
 }
 
 .source {
@@ -106,7 +115,7 @@ section {
 label,
 h2 {
   margin: 0;
-  font-size: 12px;
+  font-size: 1rem;
   font-weight: normal;
   color: var(--muted);
 }
@@ -121,7 +130,7 @@ button {
 }
 
 select {
-  padding: 4px 6px;
+  padding: 5px 8px;
   background: var(--editor);
 }
 
@@ -147,7 +156,7 @@ input:focus-visible {
   padding: 8px 10px;
   border: 1px solid var(--line);
   border-radius: 4px;
-  font: 13px/1.5 var(--mono);
+  font: 1rem/1.5 var(--mono);
   letter-spacing: 0;
   tab-size: 2;
   white-space: pre-wrap;
@@ -157,7 +166,7 @@ input:focus-visible {
 
 .editor textarea {
   position: relative;
-  min-height: 240px;
+  min-height: 16em;
   resize: vertical;
   overflow-y: auto;
   background: transparent;
@@ -177,7 +186,6 @@ input:focus-visible {
 
 .hint {
   margin: 0;
-  font-size: 12px;
   color: var(--muted);
 }
 
@@ -187,7 +195,7 @@ code {
 }
 
 button {
-  padding: 4px 10px;
+  padding: 5px 12px;
   background: var(--element);
   cursor: pointer;
 }
@@ -233,15 +241,16 @@ input[type="range"] {
 .stage {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 16px;
   min-width: 0;
+  container-type: inline-size;
 }
 
 .controls {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 
 .speed {
@@ -253,12 +262,19 @@ input[type="range"] {
 
 .canvas {
   position: relative;
-  height: min(62vh, 640px);
-  min-height: 320px;
+  flex: 1 1 0;
+  min-height: max(320px, 50vh);
   border: 1px solid var(--line-soft);
   border-radius: 4px;
   background: var(--editor);
   overflow: hidden;
+}
+
+@media (max-width: 860px) {
+  .canvas {
+    flex: none;
+    height: 75vh;
+  }
 }
 
 .canvas svg {
@@ -381,28 +397,24 @@ input[type="range"] {
 
 .readout {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1.4fr) auto;
-  gap: 16px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) auto;
+  gap: 20px;
   align-items: start;
 }
 
-@media (max-width: 1100px) {
-  .readout {
-    grid-template-columns: minmax(0, 1fr);
-  }
+/* Three lines each, scrolling beyond: if they grew with their text, the
+   canvas would change size, and the net with it, from one step to the next. */
+.readout pre,
+.readout p {
+  height: 4.5em;
+  margin: 4px 0 0;
+  overflow: auto;
 }
 
 .readout pre {
-  margin: 4px 0 0;
-  max-height: 9em;
-  overflow: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font: 13px/1.5 var(--mono);
-}
-
-.readout p {
-  margin: 4px 0 0;
+  font: 1rem/1.5 var(--mono);
 }
 
 .next strong {
@@ -413,30 +425,59 @@ input[type="range"] {
 .stats {
   display: grid;
   grid-template-columns: repeat(2, auto);
-  gap: 6px 20px;
+  gap: 8px 24px;
   margin: 0;
 }
 
 .stats dt {
-  font-size: 12px;
   color: var(--muted);
 }
 
 .stats dd {
   margin: 0;
-  font: 16px/1.2 var(--mono);
+  font: 1.25rem/1.2 var(--mono);
   color: var(--number);
   font-variant-numeric: tabular-nums;
+}
+
+/* Narrower, the counts move under the text, and then the text stacks. */
+@container (max-width: 60em) {
+  .readout {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr);
+  }
+
+  .stats {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(4, auto);
+    justify-content: start;
+  }
+}
+
+@container (max-width: 44em) {
+  .readout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* In one column the canvas has a height of its own, so the text can grow. */
+@media (max-width: 860px) {
+  .readout pre,
+  .readout p {
+    height: auto;
+  }
+
+  .readout pre {
+    max-height: 9em;
+  }
 }
 
 .legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px 18px;
+  gap: 6px 20px;
   margin: 0;
   padding: 0;
   list-style: none;
-  font-size: 12px;
   color: var(--muted);
 }
 
