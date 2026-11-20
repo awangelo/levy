@@ -277,7 +277,9 @@ function boundsOf(points) {
 }
 
 const mix = (from, to, t) => from + (to - from) * t;
-const ease = (t) => 1 - (1 - t) ** 3;
+// Starts and ends at rest. An ease-out starts at three times the average speed,
+// which at the slow end of the slider reads as a jump and then a crawl.
+const ease = (t) => (1 - Math.cos(Math.PI * t)) / 2;
 
 function duration() {
   const slow = 1 - Number(ui.speed.value) / 100;
