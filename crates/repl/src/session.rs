@@ -13,7 +13,7 @@ use levy_core::{
 };
 
 /// Work allowed per evaluation unless `:fuel` says otherwise, in steps of the
-/// machine's walk. This is a few seconds, and bounds the memory as well.
+/// machine's walk: a few seconds for ordinary terms.
 const DEFAULT_FUEL: u64 = 100_000_000;
 /// Terms larger than this many nodes are summarized instead of printed.
 const PRINT_LIMIT: usize = 2_000;

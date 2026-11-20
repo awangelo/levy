@@ -206,12 +206,15 @@ impl Machine {
 
     /// Reduces to normal form and returns it.
     ///
-    /// `fuel` bounds the work, and with it the time and the memory the call
-    /// takes: every node of the net the walk comes to costs one unit, whether
-    /// it is rewritten there or only passed. A normal form of `n` nodes
-    /// therefore needs at least `n` units. When the fuel runs out the call
-    /// returns [`Halt::OutOfFuel`], and a later call takes up the reduction
-    /// where this one stopped.
+    /// `fuel` bounds the work: every node of the net the walk comes to costs
+    /// one unit, whether it is rewritten there or only passed. A normal form
+    /// of `n` nodes therefore needs at least `n` units. A unit stands for
+    /// about the same time and memory everywhere but where scopes nest
+    /// deeply: passing a stack of delimiters closes or opens a scope for each
+    /// delimiter in it, and closing or opening a scope moves the scopes
+    /// inside it. When the fuel runs out the call returns
+    /// [`Halt::OutOfFuel`], and a later call takes up the reduction where
+    /// this one stopped.
     pub fn normalize(&mut self, fuel: u64) -> Result<Term, Halt> {
         self.normalize_unless(fuel, &|| false)
     }

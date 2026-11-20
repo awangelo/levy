@@ -61,7 +61,7 @@ Definitions are expanded when a term is parsed, so a definition cannot refer to 
 
 ### Stopping
 
-An evaluation stops when you press Ctrl-C or when it runs out of fuel, and either way the session goes on. Fuel bounds the work, and with it the time and memory, of one evaluation: 100 million steps unless `:fuel` sets another limit.
+An evaluation stops when you press Ctrl-C or when it runs out of fuel, and either way the session goes on. Fuel bounds the work of one evaluation: 100 million steps unless `:fuel` sets another limit. For ordinary terms that is a few seconds, and it bounds the memory too.
 
 ### Files and scripts
 
@@ -117,6 +117,7 @@ The random terms come from a fixed seed, so a failure can always be reproduced. 
 - **Optimal in β-steps, not in time.** Keeping the sharing correct takes a lot of bookkeeping, and the bookkeeping dominates: `fib 20` takes 283 β-steps but 635,474 bookkeeping interactions. Merging stacked delimiters cuts that work by up to a factor of three (2.4 on `fib 20`, much less where few delimiters pile up), but other known remedies, such as safe fans or collecting fans with a dead branch, are not implemented. On everyday programs a conventional lazy evaluator is much faster; levy wins when sharing under binders really matters.
 - **Normal forms stay shared.** The net of a normal form can still hold fans and delimiters that will never move again. Reading it back gives the plain term, but the picture on the page is bigger than the term.
 - **Big results need fuel.** Reading a result costs one unit of fuel per node, and the REPL allows 100 million of them per evaluation, a few seconds of work. A result of 50 million nodes needs a higher `:fuel`, and about 75 bytes of memory per node.
+- **Fuel counts nodes, not time.** A step of the walk goes through one node, and most steps take about the same time. Where scopes nest thousands deep they do not: a stack of delimiters closes or opens a scope for each delimiter in it, and closing or opening a scope moves the scopes inside it. A term that uses a variable bound thousands of binders out, thousands of times, can take seconds to read while spending little fuel.
 - **One pair at a time.** Reducing interacting pairs in parallel would contract redexes that are not needed, and optimality would be lost.
 - **Family counts are fingerprints.** The reference reducer hashes Lévy labels instead of storing them, so in principle a collision could throw its count off. The odds are negligible.
 - **The page draws up to 700 nodes.** Bigger nets can still be stepped through, with the term and the counters as the only feedback.
