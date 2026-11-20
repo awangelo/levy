@@ -68,23 +68,43 @@ impl Term {
         }
     }
 
-    /// The number of variables, abstractions and applications in the term.
+    /// The number of variables, abstractions and applications in the term,
+    /// or `usize::MAX` if there are that many or more.
+    ///
+    /// A shared subterm counts once for every place it occurs, but is looked
+    /// at only once: a chain of definitions that each use the one before
+    /// twice doubles the size at every link, not the time to measure it.
     pub fn size(&self) -> usize {
-        let mut size = 0;
-        let mut pending: Vec<&Term> = Vec::new();
+        // The sizes of the shared subterms measured so far.
+        let mut known: HashMap<*const Term, usize> = HashMap::new();
+        let mut pending: Vec<Measure> = Vec::new();
+        let mut size: usize = 0;
         let mut term = self;
         loop {
-            size += 1;
-            term = match term {
-                Term::Lam(_, body) => body,
+            size = size.saturating_add(1);
+            match term {
+                Term::Var(_) | Term::Free(_) => {}
+                Term::Lam(_, body) => pending.push(Measure::Count(body)),
                 Term::App(func, arg) => {
-                    pending.push(arg);
-                    func
+                    pending.push(Measure::Count(arg));
+                    pending.push(Measure::Count(func));
                 }
-                Term::Var(_) | Term::Free(_) => match pending.pop() {
-                    Some(next) => next,
+            }
+            term = loop {
+                match pending.pop() {
                     None => return size,
-                },
+                    Some(Measure::Done(shared, before)) => {
+                        known.insert(Arc::as_ptr(shared), size - before);
+                    }
+                    Some(Measure::Count(child)) if Arc::strong_count(child) == 1 => break child,
+                    Some(Measure::Count(child)) => match known.get(&Arc::as_ptr(child)) {
+                        Some(&measured) => size = size.saturating_add(measured),
+                        None => {
+                            pending.push(Measure::Done(child, size));
+                            break child;
+                        }
+                    },
+                }
             };
         }
     }
@@ -92,11 +112,10 @@ impl Term {
     /// The term as text, or a note of its size if it has more than `limit`
     /// nodes and so would be too long to be worth reading.
     pub fn abbreviated(&self, limit: usize) -> String {
-        let size = self.size();
-        if size > limit {
-            format!("<a term of {size} nodes>")
-        } else {
-            self.to_string()
+        match self.size() {
+            usize::MAX => format!("<a term of {} nodes or more>", usize::MAX),
+            size if size > limit => format!("<a term of {size} nodes>"),
+            _ => self.to_string(),
         }
     }
 
@@ -110,12 +129,18 @@ impl Term {
     fn free_name_set(&self) -> HashSet<&str> {
         let mut names = HashSet::new();
         let mut pending: Vec<&Term> = vec![self];
+        let mut seen: HashSet<*const Term> = HashSet::new();
         while let Some(term) = pending.pop() {
             match term {
                 Term::Var(_) => {}
                 Term::Free(name) => {
                     names.insert(name.as_str());
                 }
+                // A subterm can be shared, as a definition used twice is,
+                // and what is free in it is the same wherever it sits. One
+                // look is enough: a chain of definitions that each use the
+                // one before twice would otherwise double the work each time.
+                _ if !seen.insert(std::ptr::from_ref(term)) => {}
                 Term::Lam(_, body) => pending.push(body),
                 Term::App(func, arg) => {
                     pending.push(arg);
@@ -143,6 +168,15 @@ impl Term {
             }
         }
     }
+}
+
+/// What is left to do while measuring a term.
+enum Measure<'a> {
+    /// Count the nodes of this subterm.
+    Count(&'a Arc<Term>),
+    /// This shared subterm is counted: the nodes counted since there were
+    /// this many are its size.
+    Done(&'a Arc<Term>, usize),
 }
 
 /// A leaf to put where a subterm was taken out.
@@ -367,6 +401,40 @@ mod tests {
         );
         assert_eq!(term.free_names(), ["a", "b"]);
         assert!(Term::church(2).free_names().is_empty());
+    }
+
+    #[test]
+    fn free_names_of_a_shared_subterm_are_looked_up_once() {
+        // Each term holds the one before twice: 2^200 nodes as a tree, and
+        // 200 as they are stored.
+        let mut term = Term::lam("x", Term::app(Term::Var(0), Term::free("a")));
+        for _ in 0..200 {
+            term = Term::app(term.clone(), term);
+        }
+        assert_eq!(term.free_names(), ["a"]);
+    }
+
+    #[test]
+    fn a_shared_subterm_is_measured_once() {
+        // Each link holds the one before twice, and is twice its size and
+        // one more: 3 × 2^n - 1 nodes as a tree.
+        let mut term = Term::lam("x", Term::Var(0));
+        for n in 1..=200 {
+            term = Term::app(term.clone(), term);
+            if n == 30 {
+                assert_eq!(term.size(), 3 * (1 << 30) - 1);
+                assert_eq!(term.abbreviated(10), "<a term of 3221225471 nodes>");
+            }
+        }
+        assert_eq!(term.size(), usize::MAX);
+        assert_eq!(
+            term.abbreviated(10),
+            format!("<a term of {} nodes or more>", usize::MAX)
+        );
+        // A subterm shared with something outside counts in full.
+        let numeral = Term::church(5);
+        let pair = Term::app(numeral.clone(), Term::app(numeral.clone(), numeral));
+        assert_eq!(pair.size(), 3 * 13 + 2);
     }
 
     #[test]
