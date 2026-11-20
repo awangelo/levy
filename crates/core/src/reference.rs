@@ -325,7 +325,7 @@ struct Reducer<'a> {
 impl Reducer<'_> {
     fn spend(&mut self) -> Result<(), BudgetExhausted> {
         self.budget = self.budget.checked_sub(1).ok_or(BudgetExhausted)?;
-        if self.budget.is_multiple_of(1 << 10) && (self.interrupted)() {
+        if self.budget.is_multiple_of(crate::INTERRUPT_CHECK) && (self.interrupted)() {
             return Err(BudgetExhausted);
         }
         Ok(())

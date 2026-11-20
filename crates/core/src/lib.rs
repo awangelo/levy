@@ -40,3 +40,6 @@ pub use rules::Rule;
 pub use script::{Definitions, Statement};
 pub use term::Term;
 pub use translate::UnboundIndex;
+
+/// How often, in units of work, a reduction asks whether it was interrupted.
+const INTERRUPT_CHECK: u64 = 1 << 10;

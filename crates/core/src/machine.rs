@@ -484,9 +484,6 @@ impl Suspended {
     }
 }
 
-/// How often, in units of fuel, a walk asks whether it was interrupted.
-const INTERRUPT_CHECK: u64 = 1 << 10;
-
 /// Reads the term a net stands for, letting its policy rewrite on the way.
 struct Walker<'a, P> {
     policy: &'a mut P,
@@ -652,7 +649,7 @@ impl<P: Policy> Walker<'_, P> {
     /// Pays for one node the walk comes to.
     fn spend(&mut self) -> Result<(), Halt> {
         self.fuel = self.fuel.checked_sub(1).ok_or(Halt::OutOfFuel)?;
-        if self.fuel.is_multiple_of(INTERRUPT_CHECK)
+        if self.fuel.is_multiple_of(crate::INTERRUPT_CHECK)
             && let Some(interrupted) = self.interrupted
             && interrupted()
         {
