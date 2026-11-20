@@ -22,9 +22,8 @@ use std::collections::BTreeMap;
 
 use levy_core::machine::readback;
 use levy_core::net::Kind;
-use levy_core::script::statements;
 use levy_core::translate::translate;
-use levy_core::{Definitions, Halt, Machine, Rule, Statement, Term, reference};
+use levy_core::{Definitions, Halt, Machine, Rule, Term, reference};
 
 /// Budget of the reference reducer, in beta-steps plus copied nodes.
 const REFERENCE_BUDGET: u64 = 20_000;
@@ -545,18 +544,13 @@ fn collecting_garbage_changes_nothing() {
 /// with. Loading the file itself keeps it tested.
 fn prelude() -> Definitions {
     let mut definitions = Definitions::new();
-    for (line, source) in statements(include_str!("../../../examples/prelude.lam")) {
-        match definitions.statement(source) {
-            Ok(Some(Statement::Define(name, term))) => {
-                assert!(
-                    term.free_names().is_empty(),
-                    "prelude line {line}: `{name}` has free variables"
-                );
-                definitions.define(name, term);
-            }
-            Ok(None) => {}
-            other => panic!("prelude line {line}: {other:?}"),
-        }
+    let terms = definitions.load(include_str!("../../../examples/prelude.lam"));
+    assert_eq!(terms, Ok(Vec::new()), "the prelude only defines");
+    for (name, term) in definitions.iter() {
+        assert!(
+            term.free_names().is_empty(),
+            "prelude: `{name}` has free variables"
+        );
     }
     definitions
 }

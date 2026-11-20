@@ -10,8 +10,9 @@
 //! recursion needs a fixed-point combinator.
 
 use std::collections::HashMap;
+use std::fmt;
 
-use crate::parse::{ParseError, is_name, parse_with};
+use crate::parse::{ParseError, is_name, parse_with, position};
 use crate::term::Term;
 
 /// One statement of a script.
@@ -22,6 +23,43 @@ pub enum Statement {
     /// A term to reduce.
     Evaluate(Term),
 }
+
+/// Why a script cannot be run: one of its statements is not one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptError {
+    /// The line of the script the problem is on, counted from 1.
+    pub line: usize,
+    /// The column of that line, counted from 1, in characters.
+    pub column: usize,
+    /// What was expected or what is wrong, without the place.
+    pub message: String,
+}
+
+impl ScriptError {
+    /// What `error` is in a script, `statement` being the statement it was
+    /// found in and `line` the line of the script that statement starts on.
+    pub fn new(line: usize, statement: &str, error: ParseError) -> ScriptError {
+        let (down, column) = position(statement, error.offset);
+        ScriptError {
+            line: line + down - 1,
+            column,
+            message: error.message,
+        }
+    }
+}
+
+impl fmt::Display for ScriptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ScriptError {
+            line,
+            column,
+            message,
+        } = self;
+        write!(f, "line {line}, column {column}: {message}")
+    }
+}
+
+impl std::error::Error for ScriptError {}
 
 /// The names defined so far.
 #[derive(Clone, Debug, Default)]
@@ -107,6 +145,22 @@ impl Definitions {
         })?;
         Ok(Some(Statement::Define(name.to_owned(), term)))
     }
+
+    /// Loads a script: defines what it defines, and returns the terms it
+    /// asks to evaluate, in order. Stops at the first statement that does
+    /// not parse, with the definitions before it made.
+    pub fn load(&mut self, script: &str) -> Result<Vec<Term>, ScriptError> {
+        let mut terms = Vec::new();
+        for (line, source) in statements(script) {
+            match self.statement(source) {
+                Ok(None) => {}
+                Ok(Some(Statement::Define(name, term))) => self.define(name, term),
+                Ok(Some(Statement::Evaluate(term))) => terms.push(term),
+                Err(error) => return Err(ScriptError::new(line, source, error)),
+            }
+        }
+        Ok(terms)
+    }
 }
 
 /// Replaces every comment by spaces, which keeps all offsets intact.
@@ -170,6 +224,30 @@ mod tests {
                 parse(r"(\x. x) (\x. x)").unwrap()
             )))
         );
+    }
+
+    #[test]
+    fn loading_a_script_defines_and_collects_the_terms() {
+        let mut definitions = Definitions::new();
+        let script = "-- two, twice\ntwo = \\f x.\n  f (f x)\ntwo\nfour = two two\nfour a\n";
+        let terms = definitions.load(script).unwrap();
+        assert_eq!(terms.len(), 2);
+        assert_eq!(terms[0], Term::church(2));
+        assert_eq!(definitions.len(), 2);
+        assert_eq!(definitions.load("-- nothing\n"), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn loading_stops_at_an_error_and_says_where_it_is() {
+        let mut definitions = Definitions::new();
+        let error = definitions
+            .load("id = \\x. x\ntwo = \\f x.\n  f (f x))\nlater = id\n")
+            .unwrap_err();
+        assert_eq!((error.line, error.column), (3, 10));
+        assert_eq!(error.to_string(), "line 3, column 10: unexpected `)`");
+        // What came before the error is defined, what comes after is not.
+        let names: Vec<&str> = definitions.iter().map(|(name, _)| name).collect();
+        assert_eq!(names, ["id"]);
     }
 
     #[test]

@@ -8,7 +8,9 @@ use levy_core::dot::to_dot;
 use levy_core::parse::{MAX_NUMERAL, position};
 use levy_core::script::statements;
 use levy_core::translate::translate;
-use levy_core::{Definitions, Halt, Machine, ParseError, Rule, Statement, Term, reference};
+use levy_core::{
+    Definitions, Halt, Machine, ParseError, Rule, ScriptError, Statement, Term, reference,
+};
 
 /// Work allowed per evaluation unless `:fuel` says otherwise, in steps of the
 /// machine's walk. This is a few seconds, and bounds the memory as well.
@@ -153,13 +155,6 @@ impl Session {
         origin: Option<Origin>,
         out: &mut dyn Output,
     ) -> Result<bool, Failed> {
-        // In a file, problems are reported with the place they are at.
-        let place = |offset: usize| {
-            origin.map(|Origin { path, line }| {
-                let (down, column) = position(source, offset);
-                format!("{path}:{}:{column}: ", line + down - 1)
-            })
-        };
         match self.definitions.statement(source) {
             Ok(None) => Ok(false),
             Ok(Some(Statement::Define(name, term))) => {
@@ -184,8 +179,16 @@ impl Session {
             }
             Ok(Some(Statement::Evaluate(term))) => self.evaluate(&term, out).map(|()| false),
             Err(error) => {
-                let message = match place(error.offset) {
-                    Some(place) => format!("{place}error: {}", error.message),
+                // In a file, a problem is reported with the place it is at.
+                let message = match origin {
+                    Some(Origin { path, line }) => {
+                        let ScriptError {
+                            line,
+                            column,
+                            message,
+                        } = ScriptError::new(line, source, error);
+                        format!("{path}:{line}:{column}: error: {message}")
+                    }
                     None => describe(source, &error),
                 };
                 fail(out, &message)

@@ -37,7 +37,7 @@ pub mod translate;
 pub use machine::{Halt, Machine, Redex, Stats};
 pub use parse::{ParseError, parse, parse_with};
 pub use rules::Rule;
-pub use script::{Definitions, Statement};
+pub use script::{Definitions, ScriptError, Statement};
 pub use term::Term;
 pub use translate::UnboundIndex;
 

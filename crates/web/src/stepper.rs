@@ -4,9 +4,7 @@
 use std::collections::VecDeque;
 
 use levy_core::net::{Kind, Net, NodeId};
-use levy_core::parse::position;
-use levy_core::script::statements;
-use levy_core::{Definitions, Halt, Machine, Rule, Statement, Term};
+use levy_core::{Definitions, Halt, Machine, Rule};
 use serde::Serialize;
 
 use crate::layout::{Diagram, layout};
@@ -137,12 +135,8 @@ const PRELUDE: &str = include_str!("../../../examples/prelude.lam");
 /// The definitions of [`PRELUDE`].
 fn prelude() -> Definitions {
     let mut definitions = Definitions::new();
-    for (_, source) in statements(PRELUDE) {
-        // A test makes sure that every statement is a definition.
-        if let Ok(Some(Statement::Define(name, body))) = definitions.statement(source) {
-            definitions.define(name, body);
-        }
-    }
+    // A test makes sure that the prelude loads, and that it only defines.
+    let _ = definitions.load(PRELUDE);
     definitions
 }
 
@@ -151,22 +145,9 @@ impl Stepper {
     /// holds several terms, the last one is reduced. The definitions of the
     /// prelude come first, so the script can use them or define them anew.
     pub fn load(script: &str) -> Result<Stepper, String> {
-        let mut definitions = prelude();
-        let mut term: Option<Term> = None;
-        for (line, source) in statements(script) {
-            match definitions.statement(source) {
-                Ok(None) => {}
-                Ok(Some(Statement::Define(name, body))) => definitions.define(name, body),
-                Ok(Some(Statement::Evaluate(body))) => term = Some(body),
-                Err(error) => {
-                    let (down, column) = position(source, error.offset);
-                    let line = line + down - 1;
-                    return Err(format!("line {line}, column {column}: {}", error.message));
-                }
-            }
-        }
-        let term = term.ok_or("the script has no term to reduce")?;
-        let machine = Machine::new(&term).map_err(|error| error.to_string())?;
+        let terms = prelude().load(script).map_err(|error| error.to_string())?;
+        let term = terms.last().ok_or("the script has no term to reduce")?;
+        let machine = Machine::new(term).map_err(|error| error.to_string())?;
         Ok(Stepper {
             snapshots: VecDeque::from([machine.clone()]),
             initial: machine.clone(),
@@ -423,16 +404,9 @@ mod tests {
 
     #[test]
     fn the_prelude_is_built_in() {
-        let mut definitions = Definitions::new();
-        for (line, source) in statements(PRELUDE) {
-            match definitions.statement(source) {
-                Ok(Some(Statement::Define(name, body))) => definitions.define(name, body),
-                // Comments.
-                Ok(None) => {}
-                other => panic!("prelude line {line} is not a definition: {other:?}"),
-            }
-        }
-        assert_eq!(prelude().len(), definitions.len());
+        // It loads, and holds no term to evaluate.
+        assert_eq!(Definitions::new().load(PRELUDE), Ok(Vec::new()));
+        assert!(prelude().get("fact").is_some());
         // A script can use the prelude without defining anything...
         let mut stepper = Stepper::load("eq (fact 3) (plus 2 4) yes no").unwrap();
         run_to_end(&mut stepper);
