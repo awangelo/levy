@@ -54,11 +54,7 @@ pub fn parse_with(
         scope: Vec::new(),
         definition,
     };
-    let term = parser.term()?;
-    match parser.peek() {
-        Token::End => Ok(term),
-        token => Err(parser.error(format!("unexpected {token}"))),
-    }
+    parser.term()
 }
 
 /// The line and the column of a byte offset into `source`, both counted
@@ -222,12 +218,11 @@ impl Parser<'_> {
         &self.tokens[self.position].1
     }
 
-    fn advance(&mut self) -> Token {
-        let token = self.tokens[self.position].1.clone();
-        if token != Token::End {
+    /// Moves on to the next token. The end of the input is never passed.
+    fn advance(&mut self) {
+        if *self.peek() != Token::End {
             self.position += 1;
         }
-        token
     }
 
     fn error(&self, message: String) -> ParseError {
