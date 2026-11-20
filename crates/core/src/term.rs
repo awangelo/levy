@@ -82,21 +82,14 @@ impl Term {
         let mut term = self;
         loop {
             size = size.saturating_add(1);
-            match term {
-                Term::Var(_) | Term::Free(_) => {}
-                Term::Lam(_, body) => pending.push(Measure::Count(body)),
-                Term::App(func, arg) => {
-                    pending.push(Measure::Count(arg));
-                    pending.push(Measure::Count(func));
-                }
-            }
+            pending.extend(term.children().map(Measure::Count));
             term = loop {
                 match pending.pop() {
                     None => return size,
                     Some(Measure::Done(shared, before)) => {
                         known.insert(Arc::as_ptr(shared), size - before);
                     }
-                    Some(Measure::Count(child)) if Arc::strong_count(child) == 1 => break child,
+                    Some(Measure::Count(child)) if !is_shared(child) => break child,
                     Some(Measure::Count(child)) => match known.get(&Arc::as_ptr(child)) {
                         Some(&measured) => size = size.saturating_add(measured),
                         None => {
@@ -130,27 +123,33 @@ impl Term {
 
     fn free_name_set(&self) -> HashSet<&str> {
         let mut names = HashSet::new();
-        let mut pending: Vec<&Term> = vec![self];
+        // The shared subterms looked at so far. What is free in one is the
+        // same wherever it sits, so one look is enough: a chain of
+        // definitions that each use the one before twice would otherwise
+        // double the work at every link.
         let mut seen: HashSet<*const Term> = HashSet::new();
+        let mut pending: Vec<&Term> = vec![self];
         while let Some(term) = pending.pop() {
-            match term {
-                Term::Var(_) => {}
-                Term::Free(name) => {
-                    names.insert(name.as_str());
-                }
-                // A subterm can be shared, as a definition used twice is,
-                // and what is free in it is the same wherever it sits. One
-                // look is enough: a chain of definitions that each use the
-                // one before twice would otherwise double the work each time.
-                _ if !seen.insert(std::ptr::from_ref(term)) => {}
-                Term::Lam(_, body) => pending.push(body),
-                Term::App(func, arg) => {
-                    pending.push(arg);
-                    pending.push(func);
+            if let Term::Free(name) = term {
+                names.insert(name.as_str());
+            }
+            for child in term.children() {
+                if !is_shared(child) || seen.insert(Arc::as_ptr(child)) {
+                    pending.push(child);
                 }
             }
         }
         names
+    }
+
+    /// The subterms right below this one, the function side first.
+    fn children(&self) -> impl Iterator<Item = &Arc<Term>> {
+        let (first, second) = match self {
+            Term::Var(_) | Term::Free(_) => (None, None),
+            Term::Lam(_, body) => (Some(body), None),
+            Term::App(func, arg) => (Some(func), Some(arg)),
+        };
+        first.into_iter().chain(second)
     }
 
     /// Moves the subterms that have subterms of their own into `pending`,
@@ -170,6 +169,13 @@ impl Term {
             }
         }
     }
+}
+
+/// Whether a subterm may be met more than once: it has other owners, in this
+/// term or outside it. A subterm with none can only be met once, and needs
+/// no remembering.
+fn is_shared(child: &Arc<Term>) -> bool {
+    Arc::strong_count(child) > 1
 }
 
 /// A number of nodes as [`Term::size`] counts them, ready to be shown:
