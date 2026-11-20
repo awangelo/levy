@@ -365,13 +365,33 @@ impl Session {
 
     /// Loads a term into a machine.
     fn machine(&self, term: &Term, out: &mut dyn Output) -> Result<Machine, Failed> {
+        self.admit(term, out)?;
         Machine::new(term).or_else(|error| fail(out, &format!("error: {error}")))
     }
 
     fn dot(&self, term: &Term, out: &mut dyn Output) -> Result<(), Failed> {
+        self.admit(term, out)?;
         let net = translate(term).or_else(|error| fail(out, &format!("error: {error}")))?;
         out.line(to_dot(&net).trim_end());
         Ok(())
+    }
+
+    /// Refuses a term whose net would have more nodes than the fuel allows
+    /// steps. Definitions are expanded, so a line of a few words can stand
+    /// for a term too large to build, and building it comes before any fuel
+    /// is spent.
+    fn admit(&self, term: &Term, out: &mut dyn Output) -> Result<(), Failed> {
+        let size = term.size();
+        if u64::try_from(size).is_ok_and(|size| size <= self.fuel) {
+            return Ok(());
+        }
+        let more = if size == usize::MAX { " or more" } else { "" };
+        let message = format!(
+            "error: the term has {size}{more} nodes with its definitions expanded, \
+             more than the limit of {} steps; raise it with `:fuel`",
+            self.fuel
+        );
+        fail(out, &message)
     }
 
     fn explain(&self, halt: Halt, machine: &Machine) -> String {
@@ -642,6 +662,44 @@ mod tests {
         assert!(lines[101].starts_with("100 β-steps"), "{lines:?}");
         let lines = run(&mut session, r":trace 99 (\x. x) a");
         assert_eq!(lines[101], "stopped after 100 β-steps");
+    }
+
+    #[test]
+    fn definitions_that_double_are_quick_to_make() {
+        // Each uses the one before twice: 2^63 nodes as a tree, which only
+        // looking at each shared term once can get through.
+        let mut session = session();
+        assert!(run(&mut session, r"d0 = \x. x").is_empty());
+        for n in 1..=63 {
+            let lines = run(&mut session, &format!("d{n} = d{} d{}", n - 1, n - 1));
+            assert!(lines.is_empty(), "{lines:?}");
+        }
+        assert_eq!(run(&mut session, "d2")[0], "λx. x");
+        // Listing them measures each shared term once.
+        let lines = run(&mut session, ":defs");
+        assert_eq!(lines[10], "d10 = <a term of 3071 nodes>");
+        assert_eq!(lines[40], "d40 = <a term of 3298534883327 nodes>");
+        assert_eq!(
+            lines[63],
+            format!("d63 = <a term of {} nodes or more>", usize::MAX)
+        );
+        // Nothing builds a net of trillions of nodes.
+        for input in ["d40", ":compare d40", ":trace d40", ":dot d40"] {
+            let lines = run(&mut session, input);
+            assert_eq!(
+                lines,
+                [
+                    "error: the term has 3298534883327 nodes with its definitions expanded, \
+                     more than the limit of 100000000 steps; raise it with `:fuel`"
+                ],
+                "{input}"
+            );
+            assert!(failed(&mut session, input), "{input}");
+        }
+        assert!(run(&mut session, ":fuel 22").is_empty());
+        assert!(failed(&mut session, "d3"));
+        assert!(run(&mut session, ":fuel 23").is_empty());
+        assert!(!failed(&mut session, ":dot d3"));
     }
 
     #[test]

@@ -16,6 +16,11 @@ const PRINT_LIMIT: usize = 600;
 const READ_FUEL: u64 = 10_000;
 /// What the frame says in place of a term that takes more than that.
 const TOO_LARGE: &str = "<a term too large to show>";
+/// The most nodes a term may have, its definitions expanded, for the page to
+/// load it. Definitions are expanded, so a script of a few lines can stand
+/// for a term too large to build, and building it comes before any fuel is
+/// spent.
+const LARGEST_TERM: usize = 1_000_000;
 /// How many operations lie between two of the states kept for stepping back.
 const OPERATIONS_PER_SNAPSHOT: usize = 32;
 /// How many places for nodes the kept states may hold between them, the
@@ -147,6 +152,14 @@ impl Stepper {
     pub fn load(script: &str) -> Result<Stepper, String> {
         let terms = prelude().load(script).map_err(|error| error.to_string())?;
         let term = terms.last().ok_or("the script has no term to reduce")?;
+        let size = term.size();
+        if size > LARGEST_TERM {
+            let more = if size == usize::MAX { " or more" } else { "" };
+            return Err(format!(
+                "the term has {size}{more} nodes with its definitions expanded, \
+                 more than the {LARGEST_TERM} the page takes"
+            ));
+        }
         let machine = Machine::new(term).map_err(|error| error.to_string())?;
         Ok(Stepper {
             snapshots: VecDeque::from([machine.clone()]),
@@ -643,6 +656,25 @@ mod tests {
         assert!(frame.size > 10);
         assert!(frame.nodes.is_empty() && frame.wires.is_empty());
         assert_eq!(frame.next, None);
+    }
+
+    #[test]
+    fn a_term_too_large_to_build_is_refused() {
+        // Each definition uses the one before twice: 3 × 2^n - 1 nodes.
+        let mut script = "d0 = \\x. x\n".to_owned();
+        for n in 1..=40 {
+            script += &format!("d{n} = d{} d{}\n", n - 1, n - 1);
+        }
+        assert!(Stepper::load(&format!("{script}d18")).is_ok());
+        assert_eq!(
+            Stepper::load(&format!("{script}d19")).err(),
+            Some(
+                "the term has 1572863 nodes with its definitions expanded, \
+                 more than the 1000000 the page takes"
+                    .to_owned()
+            )
+        );
+        assert!(Stepper::load(&format!("{script}d40")).is_err());
     }
 
     #[test]

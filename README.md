@@ -120,6 +120,7 @@ The random terms come from a fixed seed, so a failure can always be reproduced. 
 - **One pair at a time.** Reducing interacting pairs in parallel would contract redexes that are not needed, and optimality would be lost.
 - **Family counts are fingerprints.** The reference reducer hashes Lévy labels instead of storing them, so in principle a collision could throw its count off. The odds are negligible.
 - **The page draws up to 700 nodes.** Bigger nets can still be stepped through, with the term and the counters as the only feedback.
+- **Definitions are expanded, not shared.** A name stands for a whole term wherever it is used, so a term that uses a definition twice is reduced with two copies of it. A chain of definitions that each use the one before twice is quick to write and doubles in size at every link. The REPL refuses a term with more nodes than its fuel allows steps, and the page one of more than a million.
 
 ## References
 
