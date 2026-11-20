@@ -44,8 +44,9 @@ impl std::error::Error for BudgetExhausted {}
 /// Reduces `term` to normal form in normal order.
 ///
 /// `budget` bounds the work: each β-step costs one unit, and so does each
-/// node copied by a substitution. That bounds the memory as well, and since
-/// nothing here recurses on the shape of a term, the stack is no limit.
+/// node a substitution goes through or copies. With the size of `term`, that
+/// bounds the time and the memory as well, and since nothing here recurses
+/// on the shape of a term, the stack is no limit.
 pub fn normalize(term: &Term, budget: u64) -> Result<Outcome, BudgetExhausted> {
     normalize_unless(term, budget, &|| false)
 }
@@ -332,15 +333,24 @@ impl Reducer<'_> {
     }
 
     fn normalize(&mut self, term: Labelled) -> Result<Labelled, BudgetExhausted> {
-        let open = |node: Labelled| {
-            let (label, shape) = self.head_normalize(node)?.into_parts();
+        // Each node goes with whether it is in head normal form already, as
+        // the function side of an application stuck on a variable is. Taking
+        // it to head normal form again would walk the spine of the
+        // application once for every argument.
+        let open = |(node, head_normal): (Labelled, bool)| {
+            let node = if head_normal {
+                node
+            } else {
+                self.head_normalize(node)?
+            };
+            let (label, shape) = node.into_parts();
             Ok(match shape {
-                Shape::Lam(name, body) => Opened::Lam((label, name), *body),
-                Shape::App(func, arg) => Opened::App(label, *func, *arg),
+                Shape::Lam(name, body) => Opened::Lam((label, name), (*body, false)),
+                Shape::App(func, arg) => Opened::App(label, (*func, true), (*arg, false)),
                 leaf => Opened::Leaf(Labelled { label, shape: leaf }),
             })
         };
-        rebuild(term, open, Labelled::lam, Labelled::app)
+        rebuild((term, false), open, Labelled::lam, Labelled::app)
     }
 
     /// Contracts head redexes until the term is an abstraction or is stuck on
@@ -384,7 +394,8 @@ impl Reducer<'_> {
     }
 
     /// Replaces the variable bound by the binder just outside `target` by
-    /// `arg`, whose label gets `mark` in front at every occurrence.
+    /// `arg`, whose label gets `mark` in front at every occurrence. Every
+    /// node of `target` costs a unit, as does every node of the copies.
     fn substitute(
         &mut self,
         target: Labelled,
@@ -393,6 +404,7 @@ impl Reducer<'_> {
     ) -> Result<Labelled, BudgetExhausted> {
         // Each node goes with the number of binders between it and the top.
         let open = |(node, depth): (Labelled, usize)| {
+            self.spend()?;
             let (label, shape) = node.into_parts();
             let shape = match shape {
                 Shape::Var(index) if index == depth => {
@@ -524,6 +536,26 @@ mod tests {
         // One more binder is uncovered at every step, until the budget ends.
         let deepening = parse(r"(\x y. x x) (\x y. x x)").unwrap();
         assert_eq!(normalize(&deepening, 300_000).unwrap_err(), BudgetExhausted);
+    }
+
+    #[test]
+    fn the_budget_covers_every_node_a_step_goes_through() {
+        // One β-step, the one node of its body, and the 2n + 1 nodes of the
+        // argument it copies there.
+        let n = 100_000;
+        let term = parse(&format!(r"(\x. x) (f{})", " a".repeat(n))).unwrap();
+        let needed = 2 * n as u64 + 3;
+        let outcome = normalize(&term, needed).unwrap();
+        assert_eq!(outcome.normal_form.size(), 2 * n + 1);
+        assert_eq!(normalize(&term, needed - 1).unwrap_err(), BudgetExhausted);
+        // A body is paid for as it is gone through, even if nothing is
+        // copied into it.
+        let term = parse(&format!(r"(\x. f{}) a", " b".repeat(n))).unwrap();
+        assert_eq!(
+            normalize(&term, 2 * n as u64 + 1).unwrap_err(),
+            BudgetExhausted
+        );
+        assert!(normalize(&term, 2 * n as u64 + 2).is_ok());
     }
 
     #[test]
