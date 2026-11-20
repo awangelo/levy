@@ -47,13 +47,30 @@ pub struct Outcome {
     pub failed: bool,
 }
 
+impl Outcome {
+    /// The outcome of an input that does not ask to leave.
+    fn of<T>(result: Result<T, Failed>) -> Outcome {
+        Outcome {
+            quit: false,
+            failed: result.is_err(),
+        }
+    }
+}
+
+/// Something could not be done, and the session has said what.
+struct Failed;
+
+/// Reports a problem.
+fn fail<T>(out: &mut dyn Output, message: &str) -> Result<T, Failed> {
+    out.remark(message);
+    Err(Failed)
+}
+
 pub struct Session {
     definitions: Definitions,
     fuel: u64,
     /// Set from outside to stop the evaluation under way.
     interrupt: Arc<AtomicBool>,
-    /// Whether the input being run has failed so far.
-    failed: bool,
 }
 
 /// Where a statement comes from: the file and the line it starts on.
@@ -71,76 +88,71 @@ impl Session {
             definitions: Definitions::new(),
             fuel: DEFAULT_FUEL,
             interrupt,
-            failed: false,
         }
     }
 
     /// Runs one line of input: a command, a definition or a term.
     pub fn execute(&mut self, input: &str, out: &mut dyn Output) -> Outcome {
-        self.failed = false;
         let input = input.trim();
-        let quit = match input.strip_prefix(':') {
-            Some(command) => {
-                let (name, argument) = command
-                    .split_once(char::is_whitespace)
-                    .unwrap_or((command, ""));
-                self.command(name, argument.trim(), out)
-            }
-            None => {
-                self.statement(input, None, out);
-                false
-            }
+        let Some(command) = input.strip_prefix(':') else {
+            return Outcome::of(self.statement(input, None, out));
         };
-        Outcome {
-            quit,
-            failed: self.failed,
+        let (name, argument) = command
+            .split_once(char::is_whitespace)
+            .unwrap_or((command, ""));
+        if matches!(name, "q" | "quit" | "exit") {
+            return Outcome {
+                quit: true,
+                failed: false,
+            };
         }
+        Outcome::of(self.command(name, argument.trim(), out))
     }
 
     /// Runs the statements of a file.
     pub fn load(&mut self, path: &str, out: &mut dyn Output) -> Outcome {
-        self.failed = false;
-        self.load_file(path, out);
-        Outcome {
-            quit: false,
-            failed: self.failed,
-        }
+        Outcome::of(self.load_file(path, out))
     }
 
     fn interrupted(&self) -> bool {
         self.interrupt.load(Ordering::Relaxed)
     }
 
-    /// Reports a problem and marks the input as failed.
-    fn fail(&mut self, out: &mut dyn Output, message: &str) {
-        self.failed = true;
-        out.remark(message);
-    }
-
-    /// Runs a command and reports whether it asks to quit.
-    fn command(&mut self, name: &str, argument: &str, out: &mut dyn Output) -> bool {
+    /// Runs a command other than the one to quit.
+    fn command(&mut self, name: &str, argument: &str, out: &mut dyn Output) -> Result<(), Failed> {
         match name {
-            "q" | "quit" | "exit" => return true,
-            "h" | "help" | "?" => out.line(&help()),
-            "defs" => self.list_definitions(out),
+            "h" | "help" | "?" => {
+                out.line(&help());
+                Ok(())
+            }
+            "defs" => {
+                self.list_definitions(out);
+                Ok(())
+            }
             "fuel" => self.set_fuel(argument, out),
             "load" => self.load_file(argument, out),
-            "compare" | "trace" | "dot" => match self.definitions.parse(argument) {
-                Ok(term) => match name {
-                    "compare" => self.compare(&term, out),
-                    "trace" => self.trace(&term, out),
-                    _ => self.dot(&term, out),
-                },
-                Err(error) => self.fail(out, &describe(argument, &error)),
-            },
-            _ => self.fail(out, &format!("unknown command `:{name}`; try `:help`")),
+            "compare" => self.compare(&self.term(argument, out)?, out),
+            "trace" => self.trace(&self.term(argument, out)?, out),
+            "dot" => self.dot(&self.term(argument, out)?, out),
+            _ => fail(out, &format!("unknown command `:{name}`; try `:help`")),
         }
-        false
+    }
+
+    /// Parses the term a command is given.
+    fn term(&self, source: &str, out: &mut dyn Output) -> Result<Term, Failed> {
+        self.definitions
+            .parse(source)
+            .or_else(|error| fail(out, &describe(source, &error)))
     }
 
     /// Runs one statement, typed at the prompt or read from a file. Returns
     /// whether it was a definition.
-    fn statement(&mut self, source: &str, origin: Option<Origin>, out: &mut dyn Output) -> bool {
+    fn statement(
+        &mut self,
+        source: &str,
+        origin: Option<Origin>,
+        out: &mut dyn Output,
+    ) -> Result<bool, Failed> {
         // In a file, problems are reported with the place they are at.
         let place = |offset: usize| {
             origin.map(|Origin { path, line }| {
@@ -149,7 +161,7 @@ impl Session {
             })
         };
         match self.definitions.statement(source) {
-            Ok(None) => false,
+            Ok(None) => Ok(false),
             Ok(Some(Statement::Define(name, term))) => {
                 let free = term.free_names();
                 if !free.is_empty() {
@@ -168,75 +180,50 @@ impl Session {
                     ));
                 }
                 self.definitions.define(name, term);
-                true
+                Ok(true)
             }
-            Ok(Some(Statement::Evaluate(term))) => {
-                self.evaluate(&term, out);
-                false
-            }
+            Ok(Some(Statement::Evaluate(term))) => self.evaluate(&term, out).map(|()| false),
             Err(error) => {
                 let message = match place(error.offset) {
                     Some(place) => format!("{place}error: {}", error.message),
                     None => describe(source, &error),
                 };
-                self.fail(out, &message);
-                false
+                fail(out, &message)
             }
         }
     }
 
-    fn evaluate(&mut self, term: &Term, out: &mut dyn Output) {
-        let Some(mut machine) = self.machine(term, out) else {
-            return;
-        };
+    fn evaluate(&self, term: &Term, out: &mut dyn Output) -> Result<(), Failed> {
+        let mut machine = self.machine(term, out)?;
         let started = Instant::now();
         let outcome = machine.normalize_unless(self.fuel, &|| self.interrupted());
         let elapsed = started.elapsed();
-        let stats = machine.stats();
         match outcome {
             Ok(normal) => {
-                out.line(&show(&normal));
-                if let Some(numeral) = numeral(&normal) {
-                    out.line(&numeral);
-                }
-                out.line(&format!(
-                    "{} β-steps, {} bookkeeping steps, {elapsed:.1?}",
-                    stats.beta,
-                    stats.bookkeeping()
-                ));
+                result(&normal, out);
+                out.line(&format!("{}, {elapsed:.1?}", steps(&machine)));
+                Ok(())
             }
-            Err(halt) => {
-                let message = self.explain(halt, &machine);
-                self.fail(out, &message);
-            }
+            Err(halt) => fail(out, &self.explain(halt, &machine)),
         }
     }
 
-    fn compare(&mut self, term: &Term, out: &mut dyn Output) {
-        let Some(mut machine) = self.machine(term, out) else {
-            return;
-        };
+    fn compare(&self, term: &Term, out: &mut dyn Output) -> Result<(), Failed> {
+        let mut machine = self.machine(term, out)?;
         let optimal = machine.normalize_unless(self.fuel, &|| self.interrupted());
-        let stats = machine.stats();
-        match &optimal {
+        let reported = match &optimal {
             Ok(normal) => {
-                out.line(&show(normal));
-                if let Some(numeral) = numeral(normal) {
-                    out.line(&numeral);
-                }
-                out.line(&format!(
-                    "optimal:      {} β-steps, {} bookkeeping steps",
-                    stats.beta,
-                    stats.bookkeeping()
-                ));
+                result(normal, out);
+                out.line(&format!("optimal:      {}", steps(&machine)));
+                Ok(())
             }
             Err(halt) => {
                 let message = format!("optimal:      {}", self.explain(*halt, &machine));
-                self.fail(out, &message);
+                fail(out, &message)
             }
-        }
+        };
         if self.interrupted() {
-            return;
+            return reported;
         }
         match reference::normalize_unless(term, self.fuel, &|| self.interrupted()) {
             Ok(outcome) => {
@@ -245,26 +232,25 @@ impl Session {
                     outcome.beta_steps, outcome.families
                 ));
                 if optimal.is_ok_and(|normal| normal != outcome.normal_form) {
-                    self.fail(out, "internal error: the two normal forms differ");
+                    return fail(out, "internal error: the two normal forms differ");
                 }
+                reported
             }
-            Err(_) if self.interrupted() => self.fail(out, "normal order: interrupted"),
+            Err(_) if self.interrupted() => fail(out, "normal order: interrupted"),
             Err(_) => {
                 let message = format!("normal order: gave up after {} units of work", self.fuel);
-                self.fail(out, &message);
+                fail(out, &message)
             }
         }
     }
 
-    fn trace(&mut self, term: &Term, out: &mut dyn Output) {
-        let Some(mut machine) = self.machine(term, out) else {
-            return;
-        };
+    fn trace(&self, term: &Term, out: &mut dyn Output) -> Result<(), Failed> {
+        let mut machine = self.machine(term, out)?;
         out.line(&format!("  {}", show(term)));
         let mut shown = 0;
         let halt = loop {
             if out.is_closed() {
-                return;
+                return Ok(());
             }
             if self.interrupted() {
                 break Halt::Interrupted;
@@ -274,21 +260,16 @@ impl Session {
                 // The allowance is spent, which only matters if work is left.
                 match machine.next() {
                     Ok(None) => break Halt::OutOfFuel,
-                    Ok(Some(_)) => {
-                        let message = self.explain(Halt::OutOfFuel, &machine);
-                        return self.fail(out, &message);
-                    }
-                    Err(halt) => {
-                        let message = self.explain(halt, &machine);
-                        return self.fail(out, &message);
-                    }
+                    Ok(Some(_)) => return fail(out, &self.explain(Halt::OutOfFuel, &machine)),
+                    Err(halt) => return fail(out, &self.explain(halt, &machine)),
                 }
             }
             match machine.advance(left.min(TRACE_STRETCH), true) {
                 Ok(None) => break Halt::OutOfFuel,
                 Ok(Some(Rule::Beta)) => {
                     if shown == TRACE_LIMIT {
-                        return out.line(&format!("stopped after {TRACE_LIMIT} β-steps"));
+                        out.line(&format!("stopped after {TRACE_LIMIT} β-steps"));
+                        return Ok(());
                     }
                     shown += 1;
                     match machine.readback_within(TRACE_READ_FUEL) {
@@ -303,34 +284,18 @@ impl Session {
         };
         // Leaving the loop with the fuel untouched means the term is done.
         if halt != Halt::OutOfFuel {
-            let message = self.explain(halt, &machine);
-            return self.fail(out, &message);
+            return fail(out, &self.explain(halt, &machine));
         }
-        let stats = machine.stats();
-        out.line(&format!(
-            "{} β-steps, {} bookkeeping steps",
-            stats.beta,
-            stats.bookkeeping()
-        ));
+        out.line(&steps(&machine));
+        Ok(())
     }
 
-    fn dot(&mut self, term: &Term, out: &mut dyn Output) {
-        match translate(term) {
-            Ok(net) => out.line(to_dot(&net).trim_end()),
-            Err(error) => self.fail(out, &format!("error: {error}")),
-        }
-    }
-
-    fn load_file(&mut self, path: &str, out: &mut dyn Output) {
+    fn load_file(&mut self, path: &str, out: &mut dyn Output) -> Result<(), Failed> {
         if path.is_empty() {
-            return self.fail(out, "usage: :load FILE");
+            return fail(out, "usage: :load FILE");
         }
-        let script = match std::fs::read_to_string(path) {
-            Ok(script) => script,
-            Err(error) => {
-                return self.fail(out, &format!("error: cannot read `{path}`: {error}"));
-            }
-        };
+        let script = std::fs::read_to_string(path)
+            .or_else(|error| fail(out, &format!("error: cannot read `{path}`: {error}")))?;
         // Some editors put a byte-order mark in front, which is no part of
         // the first statement.
         let script = script.strip_prefix('\u{feff}').unwrap_or(&script);
@@ -339,23 +304,26 @@ impl Session {
         let (mut definitions, mut failures) = (0, 0);
         for (line, source) in statements(script) {
             if out.is_closed() {
-                return;
+                break;
             }
             if self.interrupted() {
                 let message = format!("{path}:{line}: interrupted, the rest is not loaded");
-                return self.fail(out, &message);
+                return fail(out, &message);
             }
-            let failed_before = std::mem::replace(&mut self.failed, false);
-            if let Some(command) = source.trim_start().strip_prefix(':') {
-                let name = command.split_whitespace().next().unwrap_or_default();
-                let message =
-                    format!("{path}:{line}: error: `:{name}` is a command, for the prompt only");
-                self.fail(out, &message);
-            } else if self.statement(source, Some(Origin { path, line }), out) {
-                definitions += 1;
+            let ran = match source.trim_start().strip_prefix(':') {
+                Some(command) => {
+                    let name = command.split_whitespace().next().unwrap_or_default();
+                    let message = format!(
+                        "{path}:{line}: error: `:{name}` is a command, for the prompt only"
+                    );
+                    fail(out, &message)
+                }
+                None => self.statement(source, Some(Origin { path, line }), out),
+            };
+            match ran {
+                Ok(defined) => definitions += usize::from(defined),
+                Err(Failed) => failures += 1,
             }
-            failures += usize::from(self.failed);
-            self.failed |= failed_before;
         }
         let plural = |count: usize| if count == 1 { "" } else { "s" };
         let mut summary = format!(
@@ -366,6 +334,7 @@ impl Session {
             summary += &format!(", {failures} statement{} failed", plural(failures));
         }
         out.line(&summary);
+        if failures == 0 { Ok(()) } else { Err(Failed) }
     }
 
     fn list_definitions(&self, out: &mut dyn Output) {
@@ -377,14 +346,29 @@ impl Session {
         }
     }
 
-    fn set_fuel(&mut self, argument: &str, out: &mut dyn Output) {
+    fn set_fuel(&mut self, argument: &str, out: &mut dyn Output) -> Result<(), Failed> {
         if argument.is_empty() {
-            return out.line(&format!("{} steps per evaluation", self.fuel));
+            out.line(&format!("{} steps per evaluation", self.fuel));
+            return Ok(());
         }
         match argument.replace('_', "").parse() {
-            Ok(fuel) => self.fuel = fuel,
-            Err(_) => self.fail(out, &format!("error: `{argument}` is not a number")),
+            Ok(fuel) => {
+                self.fuel = fuel;
+                Ok(())
+            }
+            Err(_) => fail(out, &format!("error: `{argument}` is not a number")),
         }
+    }
+
+    /// Loads a term into a machine.
+    fn machine(&self, term: &Term, out: &mut dyn Output) -> Result<Machine, Failed> {
+        Machine::new(term).or_else(|error| fail(out, &format!("error: {error}")))
+    }
+
+    fn dot(&self, term: &Term, out: &mut dyn Output) -> Result<(), Failed> {
+        let net = translate(term).or_else(|error| fail(out, &format!("error: {error}")))?;
+        out.line(to_dot(&net).trim_end());
+        Ok(())
     }
 
     fn explain(&self, halt: Halt, machine: &Machine) -> String {
@@ -403,16 +387,24 @@ impl Session {
             Halt::Malformed(reason) => format!("internal error: malformed net: {reason}"),
         }
     }
+}
 
-    fn machine(&mut self, term: &Term, out: &mut dyn Output) -> Option<Machine> {
-        match Machine::new(term) {
-            Ok(machine) => Some(machine),
-            Err(error) => {
-                self.fail(out, &format!("error: {error}"));
-                None
-            }
-        }
+/// Writes a normal form, and the number it is if it is a Church numeral.
+fn result(normal: &Term, out: &mut dyn Output) {
+    out.line(&show(normal));
+    if let Some(value) = normal.as_church() {
+        out.line(&format!("church numeral {value}"));
     }
+}
+
+/// How many interactions a machine has fired, as the session counts them.
+fn steps(machine: &Machine) -> String {
+    let stats = machine.stats();
+    format!(
+        "{} β-steps, {} bookkeeping steps",
+        stats.beta,
+        stats.bookkeeping()
+    )
 }
 
 fn help() -> String {
@@ -443,11 +435,6 @@ the indented lines that follow it."
 
 fn show(term: &Term) -> String {
     term.abbreviated(PRINT_LIMIT)
-}
-
-fn numeral(term: &Term) -> Option<String> {
-    term.as_church()
-        .map(|value| format!("church numeral {value}"))
 }
 
 /// A parse error as a message, with a caret under the offending place when
