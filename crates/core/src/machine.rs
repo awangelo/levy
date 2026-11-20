@@ -169,14 +169,14 @@ impl Machine {
         })
     }
 
-    /// What a copy of the machine costs, in places for nodes: those of the
-    /// net, and the context of a walk under way counted in the same unit.
-    pub fn slots(&self) -> usize {
+    /// Roughly the bytes a copy of the machine takes: its net, and the walk
+    /// under way if there is one, without the terms that walk has read.
+    pub fn bytes(&self) -> usize {
         let walk = match &self.progress {
-            Progress::Suspended(state) => state.context.bytes().div_ceil(Net::SLOT_BYTES),
+            Progress::Suspended(state) => state.bytes(),
             Progress::Idle | Progress::Normal => 0,
         };
-        self.net.slots() + walk
+        self.net.bytes() + walk
     }
 
     /// The net as it stands.
@@ -538,6 +538,15 @@ impl Suspended {
             pending: Vec::new(),
             arguments: 0,
         }
+    }
+
+    /// Roughly the bytes a copy of the walk takes, without the terms it has
+    /// read so far.
+    fn bytes(&self) -> usize {
+        self.context.bytes()
+            + self.binders.len() * size_of::<NodeId>()
+            + self.passed.len() * size_of::<Frame>()
+            + self.pending.len() * size_of::<Pending>()
     }
 }
 

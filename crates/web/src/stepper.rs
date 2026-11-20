@@ -28,10 +28,9 @@ const SEARCH_FUEL: u64 = 1_000_000;
 const LARGEST_TERM: usize = 1_000_000;
 /// How many operations lie between two of the states kept for stepping back.
 const OPERATIONS_PER_SNAPSHOT: usize = 32;
-/// How many places for nodes the kept states may hold between them, the
-/// contexts of their walks counted in the same unit. At some 60 bytes a
-/// place this is around 100 MB.
-const SNAPSHOT_SLOTS: usize = 2_000_000;
+/// How many bytes the kept states may take between them, as
+/// [`Machine::bytes`] counts them.
+const SNAPSHOT_BYTES: usize = 100 << 20;
 /// How many interactions before the state gone back to another state is
 /// kept, if none is nearer, so that going further back stays cheap.
 const NEARBY: u64 = 64;
@@ -129,9 +128,9 @@ pub struct Stepper {
     /// The operations that lead from the last snapshot to the current state,
     /// each as the number of interactions it fired.
     since: Vec<u64>,
-    /// How many places for nodes the snapshots may hold between them, as
-    /// [`Machine::slots`] counts them.
-    snapshot_slots: usize,
+    /// How many bytes the snapshots may take between them, as
+    /// [`Machine::bytes`] counts them.
+    snapshot_bytes: usize,
     /// What a step found wrong with the net, if one did. The machine cannot
     /// go on from there, so nothing fires until the reduction goes back.
     failure: Option<Halt>,
@@ -178,7 +177,7 @@ impl Stepper {
             current: machine,
             stretches: VecDeque::new(),
             since: Vec::new(),
-            snapshot_slots: SNAPSHOT_SLOTS,
+            snapshot_bytes: SNAPSHOT_BYTES,
             failure: None,
         })
     }
@@ -232,10 +231,10 @@ impl Stepper {
     fn keep(&mut self, state: Machine, stretch: Vec<u64>) {
         self.snapshots.push_back(state);
         self.stretches.push_back(stretch);
-        let mut slots: usize = self.snapshots.iter().map(|machine| machine.slots()).sum();
-        while slots > self.snapshot_slots && self.snapshots.len() > 1 {
+        let mut bytes: usize = self.snapshots.iter().map(Machine::bytes).sum();
+        while bytes > self.snapshot_bytes && self.snapshots.len() > 1 {
             if let Some(oldest) = self.snapshots.pop_front() {
-                slots -= oldest.slots();
+                bytes -= oldest.bytes();
             }
             self.stretches.pop_front();
         }
@@ -606,14 +605,10 @@ mod tests {
     #[test]
     fn old_states_are_forgotten_before_they_take_too_much_room() {
         let mut stepper = Stepper::load(EXPONENT).unwrap();
-        stepper.snapshot_slots = 300;
+        stepper.snapshot_bytes = 20_000;
         let total = run_to_end(&mut stepper);
-        let slots: usize = stepper
-            .snapshots
-            .iter()
-            .map(|machine| machine.slots())
-            .sum();
-        assert!(slots <= 300, "{slots}");
+        let bytes: usize = stepper.snapshots.iter().map(Machine::bytes).sum();
+        assert!(bytes <= 20_000, "{bytes}");
         // What is left of the past can still be gone back through, down to
         // the oldest state kept.
         let mut undone = 0;
