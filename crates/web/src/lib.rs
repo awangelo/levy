@@ -1,9 +1,10 @@
 //! WebAssembly bindings: a reduction the page can step through.
 //!
 //! The page hands over a script, asks for steps, and draws the frames it gets
-//! back as JSON. All the logic lives in [`stepper`], which is plain Rust and
-//! is tested as such.
+//! back as JSON. All the logic lives in [`stepper`] and in `layout`, which
+//! places the nets on the page. Both are plain Rust and are tested as such.
 
+mod layout;
 pub mod stepper;
 
 use wasm_bindgen::prelude::*;

@@ -8,8 +8,8 @@
 
 use std::collections::HashSet;
 
-use crate::gc;
-use crate::net::{Kind, Net, NodeId, Port, slot};
+use levy_core::gc;
+use levy_core::net::{Kind, Net, NodeId, Port, slot};
 
 /// Where a node goes.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -256,9 +256,8 @@ impl Planner<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::parse;
-    use crate::term::Term;
-    use crate::translate::translate;
+    use levy_core::translate::translate;
+    use levy_core::{Machine, Term, parse};
 
     fn diagram(source: &str) -> (Net, Diagram) {
         let net = translate(&parse(source).unwrap()).unwrap();
@@ -321,7 +320,6 @@ mod tests {
 
     #[test]
     fn a_reduction_stays_one_tree_with_no_two_nodes_on_one_spot() {
-        use crate::machine::Machine;
         let two = r"(\f x. f (f x))";
         let fact = r"(\n. n (\p. p (\a b s. s (\f x. f (a f x)) (\f. a (b f)))) (\s. s (\f x. x) (\f x. f x)) (\a b. b))";
         for source in [

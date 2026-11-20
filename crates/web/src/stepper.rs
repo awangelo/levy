@@ -3,12 +3,13 @@
 
 use std::collections::VecDeque;
 
-use levy_core::layout::{Diagram, layout};
 use levy_core::net::{Kind, Net, NodeId};
 use levy_core::parse::position;
 use levy_core::script::statements;
 use levy_core::{Definitions, Halt, Machine, Rule, Statement, Term};
 use serde::Serialize;
+
+use crate::layout::{Diagram, layout};
 
 /// Terms larger than this many nodes are summarized instead of printed.
 const PRINT_LIMIT: usize = 600;

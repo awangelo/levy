@@ -25,7 +25,6 @@
 mod context;
 pub mod dot;
 pub mod gc;
-pub mod layout;
 pub mod machine;
 pub mod net;
 pub mod parse;
