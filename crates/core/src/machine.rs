@@ -328,7 +328,7 @@ impl Machine {
             ..Walker::new(&mut reduce, state, fuel, interrupted)
         };
         let outcome = walker.term();
-        let spent = fuel - walker.fuel + walker.refilled;
+        let spent = walker.spent;
         let state = walker.state;
         let last = reduce.last;
         self.spent += spent;
@@ -562,11 +562,9 @@ struct Walker<'a, P> {
     refill: Option<u64>,
     /// Whether the walk has rewritten a pair.
     rewrote: bool,
-    /// How many nodes the walk has paid for. Unlike the fuel, which refills
-    /// put back up, this says when to ask whether to give up.
-    walked: u64,
-    /// How much fuel the refills have added to what the walk started with.
-    refilled: u64,
+    /// How many nodes the walk has paid for, which the fuel cannot tell once
+    /// a refill has put it back up.
+    spent: u64,
     /// Asked now and then whether to give up.
     interrupted: &'a dyn Fn() -> bool,
 }
@@ -585,8 +583,7 @@ impl<'a, P: Policy> Walker<'a, P> {
             fuel,
             refill: None,
             rewrote: false,
-            walked: 0,
-            refilled: 0,
+            spent: 0,
             interrupted,
         }
     }
@@ -665,6 +662,7 @@ impl<'a, P: Policy> Walker<'a, P> {
                         // The walk stops in front of the pair and pays for
                         // it when it goes on.
                         self.fuel += 1;
+                        self.spent -= 1;
                         return Err(Stop::Paused);
                     }
                     fired => fired?,
@@ -679,7 +677,6 @@ impl<'a, P: Policy> Walker<'a, P> {
                     // An interaction after the first has fuel of its own. The
                     // walk was left no more than this by the one before, so
                     // nothing is taken from it.
-                    self.refilled += fuel - self.fuel;
                     self.fuel = fuel;
                 }
                 // The node of the top frame is gone. Whatever replaced it
@@ -767,11 +764,11 @@ impl<'a, P: Policy> Walker<'a, P> {
 
     /// Pays for one node the walk comes to, unless it is to give up first.
     fn spend(&mut self) -> Result<(), Halt> {
-        if self.walked.is_multiple_of(crate::INTERRUPT_CHECK) && (self.interrupted)() {
+        if self.spent.is_multiple_of(crate::INTERRUPT_CHECK) && (self.interrupted)() {
             return Err(Halt::Interrupted);
         }
         self.fuel = self.fuel.checked_sub(1).ok_or(Halt::OutOfFuel)?;
-        self.walked += 1;
+        self.spent += 1;
         Ok(())
     }
 }
