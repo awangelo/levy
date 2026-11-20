@@ -47,8 +47,8 @@ impl NodeId {
     }
 }
 
-/// One port of one node.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// One port of one node. Ports are ordered by node, then by slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Port {
     /// The node the port belongs to.
     pub node: NodeId,
@@ -370,6 +370,18 @@ impl Net {
             .filter_map(|(index, cell)| cell.as_ref().map(|node| (NodeId(index), node.kind)))
     }
 
+    /// Every wire once, as the two ports it joins, the lower one first, in
+    /// the order of those lower ports. A port that is not linked, as in a
+    /// net still being built, has no wire.
+    pub fn wires(&self) -> impl Iterator<Item = [Port; 2]> + '_ {
+        self.nodes()
+            .flat_map(|(id, kind)| (0..kind.ports()).map(move |slot| id.port(slot)))
+            .filter_map(|port| {
+                let peer = self.wire(port)?;
+                (port <= peer).then_some([port, peer])
+            })
+    }
+
     /// Verifies that every port is linked to a port that links back.
     pub fn check(&self) -> Result<(), String> {
         if !matches!(self.kind(self.root), Kind::Root) {
@@ -503,6 +515,27 @@ mod tests {
         assert_eq!(net.serial(second), net.serial(first) + 1);
         let other = net.plug(second.port(slot::ARG));
         assert_ne!(net.serial(plug), net.serial(other));
+    }
+
+    #[test]
+    fn every_wire_is_listed_once() {
+        let mut net = Net::new();
+        let fan = net.add(Kind::Fan { level: 0 });
+        net.link(net.root().principal(), fan.principal());
+        // The branches of the fan are not linked yet.
+        assert_eq!(
+            net.wires().collect::<Vec<_>>(),
+            [[net.root().principal(), fan.principal()]]
+        );
+        // A wire from a node to itself is one wire too.
+        net.link(fan.port(1), fan.port(2));
+        assert_eq!(
+            net.wires().collect::<Vec<_>>(),
+            [
+                [net.root().principal(), fan.principal()],
+                [fan.port(1), fan.port(2)]
+            ]
+        );
     }
 
     #[test]

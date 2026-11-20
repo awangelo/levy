@@ -25,26 +25,16 @@ pub fn to_dot(net: &Net) -> String {
         let label = label.replace('\\', "\\\\").replace('"', "\\\"");
         writeln!(out, "  n{} [label=\"{label}\"];", id.index()).expect("writing to a string");
     }
-    for (id, kind) in net.nodes() {
-        for slot in 0..kind.ports() {
-            let port = id.port(slot);
-            // A net still being built can have ports without a wire.
-            let Some(peer) = net.wire(port) else {
-                continue;
-            };
-            if (peer.node, peer.slot) < (port.node, port.slot) {
-                continue;
-            }
-            writeln!(
-                out,
-                "  n{} -- n{} [taillabel=\"{}\", headlabel=\"{}\"];",
-                port.node.index(),
-                peer.node.index(),
-                port_name(kind, port.slot),
-                port_name(net.kind(peer.node), peer.slot),
-            )
-            .expect("writing to a string");
-        }
+    for [tail, head] in net.wires() {
+        writeln!(
+            out,
+            "  n{} -- n{} [taillabel=\"{}\", headlabel=\"{}\"];",
+            tail.node.index(),
+            head.node.index(),
+            port_name(net.kind(tail.node), tail.slot),
+            port_name(net.kind(head.node), head.slot),
+        )
+        .expect("writing to a string");
     }
     out.push_str("}\n");
     out

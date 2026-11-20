@@ -103,21 +103,13 @@ pub fn layout(net: &Net) -> Diagram {
             Some(Placement { node, column, row })
         })
         .collect();
-    let mut wires = Vec::new();
-    for (id, kind) in net.nodes() {
-        for slot in 0..kind.ports() {
-            let port = id.port(slot);
-            let Some(peer) = net.wire(port) else {
-                continue;
-            };
-            if (peer.node, peer.slot) >= (port.node, port.slot) {
-                wires.push(Wire {
-                    ends: [port, peer],
-                    in_tree: planner.tree.contains(&port) || planner.tree.contains(&peer),
-                });
-            }
-        }
-    }
+    let wires = net
+        .wires()
+        .map(|ends| Wire {
+            ends,
+            in_tree: ends.iter().any(|end| planner.tree.contains(end)),
+        })
+        .collect();
     Diagram { placements, wires }
 }
 
