@@ -37,7 +37,10 @@ pub struct Stats {
     pub commutations: u64,
     /// Delimiters that vanished at the root or at a free variable.
     pub dissolutions: u64,
-    /// Nodes removed as garbage.
+    /// Nodes removed as garbage. The erasers that a collection plugs the
+    /// ports it cut with are not counted when a later one removes them, as
+    /// their number depends on when collections ran, so the net can shrink
+    /// by more than this grows.
     pub collected: u64,
 }
 
@@ -303,7 +306,7 @@ impl Machine {
     }
 
     /// Removes the nodes the result no longer depends on and returns how
-    /// many there were.
+    /// many there were, as [`gc::collect`] counts them.
     pub fn collect(&mut self) -> usize {
         let removed = gc::collect(&mut self.net);
         self.stats.collected += removed as u64;

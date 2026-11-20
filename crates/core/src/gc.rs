@@ -43,6 +43,10 @@ pub fn reachable(net: &Net) -> Vec<bool> {
 
 /// Removes everything a reading from the root cannot reach and returns the
 /// number of nodes removed.
+///
+/// The erasers that an earlier collection plugged open ports with are not
+/// counted. How many of those there are depends on when the collections ran,
+/// and the count should depend on the reduction alone.
 pub fn collect(net: &mut Net) -> usize {
     let reached = reachable(net);
     // An eraser is no part of any reading: it lives as long as what it plugs.
@@ -68,14 +72,15 @@ pub fn collect(net: &mut Net) -> usize {
             }
         }
     }
-    for &id in &doomed {
+    let removed = doomed.iter().filter(|&&id| !net.is_plug(id)).count();
+    for id in doomed {
         net.remove(id);
     }
     for port in open {
         net.plug(port);
     }
     net.trim();
-    doomed.len()
+    removed
 }
 
 #[cfg(test)]
@@ -134,5 +139,28 @@ mod tests {
         assert_eq!(readback(machine.net()), Ok(expected));
         // Collecting again finds nothing more.
         assert_eq!(machine.collect(), 0);
+    }
+
+    #[test]
+    fn the_erasers_a_collection_adds_are_not_counted_when_they_go() {
+        // Root, a fan and two free variables. One of them is cut off and
+        // collected, which leaves an eraser on the branch it hung from.
+        let mut net = Net::new();
+        let fan = net.add(Kind::Fan { level: 0 });
+        let name = net.intern("a");
+        let (kept, dropped) = (net.add(Kind::Free { name }), net.add(Kind::Free { name }));
+        net.link(net.root().principal(), fan.port(1));
+        net.link(fan.principal(), kept.principal());
+        net.link(fan.port(2), dropped.principal());
+        assert_eq!(collect(&mut net), 1);
+        assert_eq!(net.check(), Ok(()));
+        let plug = net.peer(fan.port(2)).node;
+        assert!(net.is_plug(plug));
+        // Now the fan goes as well, and the eraser with it: one node of the
+        // reduction is gone, whenever the first collection ran.
+        net.link(net.root().principal(), kept.principal());
+        assert_eq!(collect(&mut net), 1);
+        assert_eq!(net.len(), 2);
+        assert_eq!(net.check(), Ok(()));
     }
 }

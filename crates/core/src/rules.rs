@@ -105,16 +105,13 @@ fn beta(net: &mut Net, app: NodeId, lam: NodeId) {
     let above = net.add(scope);
     net.transfer(app.port(slot::RESULT), above.principal());
     net.transfer(lam.port(slot::BODY), above.port(slot::INSIDE));
-
-    let variable = net.peer(lam.port(slot::VAR));
-    if net.kind(variable.node) == Kind::Eraser {
-        // The variable is unused: the argument is garbage and needs no scope.
-        net.transfer(app.port(slot::ARG), variable);
-    } else {
-        let below = net.add(scope);
-        net.transfer(app.port(slot::ARG), below.principal());
-        net.transfer(lam.port(slot::VAR), below.port(slot::INSIDE));
-    }
+    // An argument that an eraser waits for gets its delimiter all the same,
+    // though both are garbage from here on. The eraser may be one that a
+    // collection put in, and a reduction must make the same nodes whenever
+    // its garbage is collected.
+    let below = net.add(scope);
+    net.transfer(app.port(slot::ARG), below.principal());
+    net.transfer(lam.port(slot::VAR), below.port(slot::INSIDE));
     net.remove(app);
     net.remove(lam);
 }
@@ -337,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn beta_on_an_unused_variable_discards_the_argument() {
+    fn beta_on_an_unused_variable_hands_the_argument_to_the_eraser() {
         let mut bench = Bench::new(|net| [Kind::App, lam(net)]);
         let eraser = bench.net.add(Kind::Eraser);
         let variable = bench.nodes[1].port(slot::VAR);
@@ -345,7 +342,16 @@ mod tests {
         bench.net.link(variable, eraser.principal());
         bench.net.remove(plug);
         assert_eq!(bench.fire(), Some(Rule::Beta));
-        assert_eq!(bench.beyond(0, 1).1, Kind::Eraser);
+        // Through a delimiter, as any variable would get it.
+        let (port, kind) = bench.beyond(0, 1);
+        assert_eq!(
+            (port.slot, kind),
+            (slot::PRINCIPAL, Kind::Delim { level: 0, count: 1 })
+        );
+        assert_eq!(
+            bench.net.peer(port.node.port(slot::INSIDE)),
+            eraser.principal()
+        );
     }
 
     #[test]

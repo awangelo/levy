@@ -497,12 +497,10 @@ fn how_a_reduction_is_driven_makes_no_difference() {
             assert_eq!(collected.net().check(), Ok(()), "{term}: after {rule:?}");
         }
         assert_eq!(collected.readback().as_ref(), Ok(&normal), "{term}");
-        assert_eq!(collected.stats().beta, direct.stats().beta, "{term}");
-        assert_eq!(
-            collected.stats().interactions(),
-            direct.stats().interactions(),
-            "{term}"
-        );
+        // Once the run in one go has collected what it left lying about,
+        // even the count of what was collected is the same.
+        direct.collect();
+        assert_eq!(collected.stats(), direct.stats(), "{term}");
     }
     assert!(finished > 800, "only {finished} terms have a normal form");
 }
@@ -535,12 +533,8 @@ fn collecting_garbage_changes_nothing() {
             assert_eq!(stepped.net().check(), Ok(()), "{term}: after {rule:?}");
         }
         assert_eq!(stepped.readback(), Ok(expected), "{term}");
-        assert_eq!(stepped.stats().beta, direct.stats().beta, "{term}");
-        assert_eq!(
-            stepped.stats().interactions(),
-            direct.stats().interactions(),
-            "{term}"
-        );
+        direct.collect();
+        assert_eq!(stepped.stats(), direct.stats(), "{term}");
         removed += stepped.stats().collected;
     }
     println!("collected {removed} nodes");

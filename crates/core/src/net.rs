@@ -263,6 +263,11 @@ impl Net {
         eraser
     }
 
+    /// Whether the node is an eraser that [`plug`](Net::plug) added.
+    pub fn is_plug(&self, id: NodeId) -> bool {
+        self.serial(id) >= PLUG_SERIALS
+    }
+
     fn insert(&mut self, kind: Kind, serial: u64) -> NodeId {
         let node = Node {
             kind,
@@ -515,6 +520,8 @@ mod tests {
         assert_eq!(net.serial(second), net.serial(first) + 1);
         let other = net.plug(second.port(slot::ARG));
         assert_ne!(net.serial(plug), net.serial(other));
+        assert!(net.is_plug(plug) && net.is_plug(other));
+        assert!(!net.is_plug(first) && !net.is_plug(net.root()));
     }
 
     #[test]

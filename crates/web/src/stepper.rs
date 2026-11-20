@@ -672,6 +672,26 @@ mod tests {
     }
 
     #[test]
+    fn the_counters_do_not_depend_on_how_a_step_was_reached() {
+        // Many nodes are discarded on the way, so when garbage is collected
+        // differs a lot between one step at a time and one run to the end.
+        let script = "fact 3";
+        let mut stepped = Stepper::load(script).unwrap();
+        let mut stats = vec![stepped.frame(ALL).stats];
+        while stepped.step().unwrap().is_some() {
+            stats.push(stepped.frame(ALL).stats);
+        }
+        assert!(stats.last().unwrap().collected > 100);
+        let mut batched = Stepper::load(script).unwrap();
+        while batched.advance(1 << 20, false).unwrap().is_some() {}
+        while let Some(expected) = stats.pop() {
+            let frame = batched.frame(0);
+            assert_eq!(frame.stats, expected, "step {}", frame.step);
+            assert_eq!(batched.back(), !stats.is_empty());
+        }
+    }
+
+    #[test]
     fn frames_serialize_to_json() {
         let stepper = Stepper::load("\\x. x").unwrap();
         let json = serde_json::to_string(&stepper.frame(ALL)).unwrap();
