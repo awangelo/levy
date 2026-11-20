@@ -60,7 +60,10 @@ impl Builder {
             let (term, parent) = match job {
                 Job::Build(term, parent) => (term, parent),
                 Job::Bind(variable) => {
-                    let occurrences = self.occurrences.pop().unwrap_or_default();
+                    let occurrences = self
+                        .occurrences
+                        .pop()
+                        .expect("an abstraction lists its occurrences before its body is built");
                     self.share(variable, &occurrences);
                     continue;
                 }
