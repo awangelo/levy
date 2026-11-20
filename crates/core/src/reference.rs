@@ -29,17 +29,25 @@ pub struct Outcome {
     pub families: u64,
 }
 
-/// The reducer gave up before reaching a normal form.
+/// Why the reducer gave up before reaching a normal form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BudgetExhausted;
+pub enum GaveUp {
+    /// The budget ran out.
+    OutOfBudget,
+    /// The caller asked it to stop.
+    Interrupted,
+}
 
-impl std::fmt::Display for BudgetExhausted {
+impl std::fmt::Display for GaveUp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the reference reducer ran out of budget")
+        f.write_str(match self {
+            GaveUp::OutOfBudget => "the reference reducer ran out of budget",
+            GaveUp::Interrupted => "the reference reducer was interrupted",
+        })
     }
 }
 
-impl std::error::Error for BudgetExhausted {}
+impl std::error::Error for GaveUp {}
 
 /// Reduces `term` to normal form in normal order.
 ///
@@ -47,18 +55,17 @@ impl std::error::Error for BudgetExhausted {}
 /// node a substitution goes through or copies. With the size of `term`, that
 /// bounds the time and the memory as well, and since nothing here recurses
 /// on the shape of a term, the stack is no limit.
-pub fn normalize(term: &Term, budget: u64) -> Result<Outcome, BudgetExhausted> {
+pub fn normalize(term: &Term, budget: u64) -> Result<Outcome, GaveUp> {
     normalize_unless(term, budget, &|| false)
 }
 
 /// Like [`normalize`], but asks `interrupted` every thousand units or so
-/// whether to give up, and gives up as if the budget had run out once it
-/// says yes.
+/// whether to give up, and returns [`GaveUp::Interrupted`] once it says yes.
 pub fn normalize_unless(
     term: &Term,
     budget: u64,
     interrupted: &dyn Fn() -> bool,
-) -> Result<Outcome, BudgetExhausted> {
+) -> Result<Outcome, GaveUp> {
     let mut reducer = Reducer {
         budget,
         interrupted,
@@ -324,15 +331,15 @@ struct Reducer<'a> {
 }
 
 impl Reducer<'_> {
-    fn spend(&mut self) -> Result<(), BudgetExhausted> {
-        self.budget = self.budget.checked_sub(1).ok_or(BudgetExhausted)?;
+    fn spend(&mut self) -> Result<(), GaveUp> {
+        self.budget = self.budget.checked_sub(1).ok_or(GaveUp::OutOfBudget)?;
         if self.budget.is_multiple_of(crate::INTERRUPT_CHECK) && (self.interrupted)() {
-            return Err(BudgetExhausted);
+            return Err(GaveUp::Interrupted);
         }
         Ok(())
     }
 
-    fn normalize(&mut self, term: Labelled) -> Result<Labelled, BudgetExhausted> {
+    fn normalize(&mut self, term: Labelled) -> Result<Labelled, GaveUp> {
         // Each node goes with whether it is in head normal form already, as
         // the function side of an application stuck on a variable is. Taking
         // it to head normal form again would walk the spine of the
@@ -355,7 +362,7 @@ impl Reducer<'_> {
 
     /// Contracts head redexes until the term is an abstraction or is stuck on
     /// a variable.
-    fn head_normalize(&mut self, term: Labelled) -> Result<Labelled, BudgetExhausted> {
+    fn head_normalize(&mut self, term: Labelled) -> Result<Labelled, GaveUp> {
         // The applications above the head, outermost first, each as its label
         // and its argument.
         let mut spine: Vec<(Label, Box<Labelled>)> = Vec::new();
@@ -401,7 +408,7 @@ impl Reducer<'_> {
         target: Labelled,
         arg: &Labelled,
         mark: Label,
-    ) -> Result<Labelled, BudgetExhausted> {
+    ) -> Result<Labelled, GaveUp> {
         // Each node goes with the number of binders between it and the top.
         let open = |(node, depth): (Labelled, usize)| {
             self.spend()?;
@@ -429,7 +436,7 @@ impl Reducer<'_> {
     }
 
     /// Copies `term`, raising by `by` the variables that point out of it.
-    fn lifted(&mut self, term: &Labelled, by: usize) -> Result<Labelled, BudgetExhausted> {
+    fn lifted(&mut self, term: &Labelled, by: usize) -> Result<Labelled, GaveUp> {
         // Each node goes with the number of binders between it and the top:
         // a variable that points at least that far up points out.
         rebuild(
@@ -535,7 +542,10 @@ mod tests {
         assert_eq!(outcome.beta_steps, 1);
         // One more binder is uncovered at every step, until the budget ends.
         let deepening = parse(r"(\x y. x x) (\x y. x x)").unwrap();
-        assert_eq!(normalize(&deepening, 300_000).unwrap_err(), BudgetExhausted);
+        assert_eq!(
+            normalize(&deepening, 300_000).unwrap_err(),
+            GaveUp::OutOfBudget
+        );
     }
 
     #[test]
@@ -547,13 +557,16 @@ mod tests {
         let needed = 2 * n as u64 + 3;
         let outcome = normalize(&term, needed).unwrap();
         assert_eq!(outcome.normal_form.size(), 2 * n + 1);
-        assert_eq!(normalize(&term, needed - 1).unwrap_err(), BudgetExhausted);
+        assert_eq!(
+            normalize(&term, needed - 1).unwrap_err(),
+            GaveUp::OutOfBudget
+        );
         // A body is paid for as it is gone through, even if nothing is
         // copied into it.
         let term = parse(&format!(r"(\x. f{}) a", " b".repeat(n))).unwrap();
         assert_eq!(
             normalize(&term, 2 * n as u64 + 1).unwrap_err(),
-            BudgetExhausted
+            GaveUp::OutOfBudget
         );
         assert!(normalize(&term, 2 * n as u64 + 2).is_ok());
     }
@@ -572,12 +585,12 @@ mod tests {
     fn gives_up_when_interrupted() {
         let omega = parse(r"(\x. x x) (\x. x x)").unwrap();
         let outcome = normalize_unless(&omega, u64::MAX, &|| true);
-        assert_eq!(outcome.unwrap_err(), BudgetExhausted);
+        assert_eq!(outcome.unwrap_err(), GaveUp::Interrupted);
     }
 
     #[test]
     fn gives_up_on_divergence() {
         let omega = parse(r"(\x. x x) (\x. x x)").unwrap();
-        assert_eq!(normalize(&omega, 1_000).unwrap_err(), BudgetExhausted);
+        assert_eq!(normalize(&omega, 1_000).unwrap_err(), GaveUp::OutOfBudget);
     }
 }

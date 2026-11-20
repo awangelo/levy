@@ -6,11 +6,10 @@ use std::time::Instant;
 
 use levy_core::dot::to_dot;
 use levy_core::parse::{MAX_NUMERAL, position};
+use levy_core::reference::{self, GaveUp};
 use levy_core::script::statements;
 use levy_core::translate::translate;
-use levy_core::{
-    Definitions, Halt, Machine, ParseError, Rule, ScriptError, Statement, Term, reference,
-};
+use levy_core::{Definitions, Halt, Machine, ParseError, Rule, ScriptError, Statement, Term};
 
 /// Work allowed per evaluation unless `:fuel` says otherwise, in steps of the
 /// machine's walk: a few seconds for ordinary terms.
@@ -240,8 +239,8 @@ impl Session {
                 }
                 reported
             }
-            Err(_) if self.interrupted() => fail(out, "normal order: interrupted"),
-            Err(_) => {
+            Err(GaveUp::Interrupted) => fail(out, "normal order: interrupted"),
+            Err(GaveUp::OutOfBudget) => {
                 let message = format!("normal order: gave up after {} units of work", self.fuel);
                 fail(out, &message)
             }
