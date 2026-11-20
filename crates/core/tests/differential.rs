@@ -155,9 +155,9 @@ fn variant(machine: &Machine) -> Option<String> {
         (Rule::Annihilate, Kind::Delim { count: a, .. }, Kind::Delim { count: b, .. })
             if a != b =>
         {
-            "annihilate in part".to_owned()
+            "annihilate in part"
         }
-        (rule, ..) => format!("{rule:?}").to_lowercase(),
+        (rule, ..) => rule.name(),
     };
     Some(format!("{rule}: {} and {}", pair[0], pair[1]))
 }
@@ -199,7 +199,7 @@ fn check_steps(term: &Term, normal: Option<&Term>, seen: &mut BTreeMap<String, u
             .unwrap_or_else(|halt| panic!("{term}: {halt}"))
             .unwrap_or_else(|| panic!("{term}: {expected} was announced and nothing fired"));
         assert!(
-            expected.starts_with(&format!("{rule:?}").to_lowercase()),
+            expected.starts_with(rule.name()),
             "{term}: {expected} was announced and {rule:?} fired"
         );
         *seen.entry(expected).or_default() += 1;

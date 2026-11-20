@@ -9,7 +9,7 @@ pub mod stepper;
 
 use wasm_bindgen::prelude::*;
 
-use stepper::{Stepper, rule_name};
+use stepper::Stepper;
 
 /// A reduction in progress.
 #[wasm_bindgen]
@@ -41,7 +41,7 @@ impl Session {
             .stepper
             .advance(u64::from(interactions), until_beta)
             .map_err(|halt| JsError::new(&halt.to_string()))?;
-        Ok(fired.map(|rule| rule_name(rule).to_owned()))
+        Ok(fired.map(|rule| rule.name().to_owned()))
     }
 
     /// Interactions fired so far.

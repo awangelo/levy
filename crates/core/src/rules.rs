@@ -40,6 +40,18 @@ pub enum Rule {
     Dissolve,
 }
 
+impl Rule {
+    /// The name of the rule, in lower case.
+    pub fn name(self) -> &'static str {
+        match self {
+            Rule::Beta => "beta",
+            Rule::Annihilate => "annihilate",
+            Rule::Commute => "commute",
+            Rule::Dissolve => "dissolve",
+        }
+    }
+}
+
 /// The rule for two kinds of nodes meeting at their principal ports, if any.
 pub fn rule_for(a: Kind, b: Kind) -> Option<Rule> {
     use Kind::{App, Delim, Fan, Free, Lam, Root};

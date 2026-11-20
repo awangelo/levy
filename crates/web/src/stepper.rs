@@ -110,15 +110,6 @@ pub struct Frame {
     pub error: Option<String>,
 }
 
-pub fn rule_name(rule: Rule) -> &'static str {
-    match rule {
-        Rule::Beta => "beta",
-        Rule::Annihilate => "annihilate",
-        Rule::Commute => "commute",
-        Rule::Dissolve => "dissolve",
-    }
-}
-
 /// A reduction with its past.
 ///
 /// Going back does not need a copy of the machine per step. Reduction is
@@ -350,7 +341,7 @@ impl Stepper {
             next: self.current.next().map(|redex| NextView {
                 upper: id(net, redex.upper),
                 lower: id(net, redex.lower),
-                rule: rule_name(redex.rule),
+                rule: redex.rule.name(),
             }),
             normal: self.current.is_normal(),
             can_go_back: self.can_go_back(),
