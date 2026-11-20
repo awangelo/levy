@@ -386,19 +386,18 @@ impl Policy for Reduce<'_> {
 
     fn fire(&mut self, upper: NodeId, lower: NodeId) -> Result<bool, Halt> {
         let net = &mut self.machine.net;
-        if rules::rule_for(net.kind(upper), net.kind(lower)).is_none() {
+        let Some(rule) = rules::rule_for(net.kind(upper), net.kind(lower)) else {
             return Ok(false);
-        }
+        };
         // The walk stops at the pair it may not rewrite, not right after the
         // last one it did: the delimiters in between are merged by then, so
         // the next walk finds the net as `next` describes it.
         self.interactions = self.interactions.checked_sub(1).ok_or(Halt::OutOfFuel)?;
-        if let Some(rule) = rules::apply(net, upper, lower) {
-            self.machine.stats.record(rule);
-            self.last = Some(rule);
-            if self.until_beta && rule == Rule::Beta {
-                self.interactions = 0;
-            }
+        rules::rewrite(net, rule, upper, lower);
+        self.machine.stats.record(rule);
+        self.last = Some(rule);
+        if self.until_beta && rule == Rule::Beta {
+            self.interactions = 0;
         }
         // Everything the walk holds on to is reachable from the root, so
         // collecting in the middle of it is safe.

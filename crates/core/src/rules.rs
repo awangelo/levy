@@ -68,8 +68,16 @@ pub fn rule_for(a: Kind, b: Kind) -> Option<Rule> {
 /// Returns the rule that was applied, or `None` if the pair does not
 /// interact, in which case the net is unchanged.
 pub fn apply(net: &mut Net, a: NodeId, b: NodeId) -> Option<Rule> {
-    debug_assert_eq!(net.peer(a.principal()), b.principal());
     let rule = rule_for(net.kind(a), net.kind(b))?;
+    rewrite(net, rule, a, b);
+    Some(rule)
+}
+
+/// Rewrites the pair `a`, `b` by `rule`, which must be the one [`rule_for`]
+/// gives for it. The principal ports of the two must face each other.
+pub fn rewrite(net: &mut Net, rule: Rule, a: NodeId, b: NodeId) {
+    debug_assert_eq!(net.peer(a.principal()), b.principal());
+    debug_assert_eq!(rule_for(net.kind(a), net.kind(b)), Some(rule));
     match rule {
         Rule::Beta => {
             let (app, lam) = if net.kind(a) == Kind::App {
@@ -90,7 +98,6 @@ pub fn apply(net: &mut Net, a: NodeId, b: NodeId) -> Option<Rule> {
             dissolve(net, delimiter, anchor);
         }
     }
-    Some(rule)
 }
 
 fn beta(net: &mut Net, app: NodeId, lam: NodeId) {
@@ -181,7 +188,7 @@ fn crossing(me: Kind, other: Kind) -> Kind {
             level: raised(level),
             count,
         },
-        other => other,
+        unchanged => unchanged,
     }
 }
 
