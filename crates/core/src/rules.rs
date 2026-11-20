@@ -75,16 +75,6 @@ pub fn rule_for(a: Kind, b: Kind) -> Option<Rule> {
     }
 }
 
-/// Rewrites the pair `a`, `b`, whose principal ports must face each other.
-///
-/// Returns the rule that was applied, or `None` if the pair does not
-/// interact, in which case the net is unchanged.
-pub fn apply(net: &mut Net, a: NodeId, b: NodeId) -> Option<Rule> {
-    let rule = rule_for(net.kind(a), net.kind(b))?;
-    rewrite(net, rule, a, b);
-    Some(rule)
-}
-
 /// Rewrites the pair `a`, `b` by `rule`, which must be the one [`rule_for`]
 /// gives for it. The principal ports of the two must face each other.
 pub fn rewrite(net: &mut Net, rule: Rule, a: NodeId, b: NodeId) {
@@ -260,6 +250,15 @@ pub fn merge(net: &mut Net, exit: Port) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
     use crate::net::Port;
+
+    /// Rewrites the pair `a`, `b`, whose principal ports must face each
+    /// other. Returns the rule that was applied, or `None` if the pair does
+    /// not interact, in which case the net is unchanged.
+    fn apply(net: &mut Net, a: NodeId, b: NodeId) -> Option<Rule> {
+        let rule = rule_for(net.kind(a), net.kind(b))?;
+        rewrite(net, rule, a, b);
+        Some(rule)
+    }
 
     /// A net with `kinds` as loose nodes, each auxiliary port plugged by its
     /// own free variable so that rewiring can be inspected.
