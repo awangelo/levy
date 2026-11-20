@@ -1,27 +1,43 @@
 # levy
 
-An untyped λ-calculus interpreter that reduces terms optimally in Lévy’s sense: it contracts each family of redexes once, no matter how many copies ordinary reduction would create. It includes a REPL and an interactive web page that shows each graph rewrite step.
+levy is an interpreter for the untyped λ-calculus that reduces terms *optimally*, in the sense Jean-Jacques Lévy defined in 1978: when evaluation copies a function, the work inside it is not copied with it. levy contracts each family of redexes once, so it takes the fewest β-steps that any evaluator can. It comes with a REPL and a web page where you can watch a reduction one graph rewrite at a time.
+
+![The web page in the middle of a reduction: a fan is about to copy the abstraction λx, while the redex (λy. y) x inside it is stored once](docs/screenshot.png)
+
+## Optimal reduction
+
+An ordinary evaluator shares an argument between its uses, but not the work inside a function body. Copy `\x. (\y. y) x` to two places, and the redex `(\y. y) x` in it is reduced once in each copy. Nest that a few times and the copies multiply:
+
+| Term | Normal order | levy |
+|---|---|---|
+| `2 2 2 2 id id` | 258,294 β-steps | 27 β-steps |
+| `fact 5` | 26,898 | 123 |
+| `fib 20` | 255,319 | 283 |
+
+Numbers are Church numerals, and `id`, `fact` and `fib` come from `examples/prelude.lam`. The REPL's `:compare` prints both counts for any term.
+
+The catch is bookkeeping. Keeping all that sharing correct takes many small graph rewrites besides the β-steps (635,474 of them for `fib 20`), so on everyday programs levy is slower than an ordinary evaluator. It is a way to see and study optimal reduction, not to run programs fast; see [Limitations](#limitations).
+
+## Interaction nets
+
+levy does not rewrite the term as text. It turns it into an *interaction net*: a graph with a node for every λ and every application, where computing means applying a few local rules, each of which rewrites one pair of nodes wired to each other. Two more kinds of node do the bookkeeping. A *fan* lets one subterm be used in several places, and copies it one node at a time, only when the reduction gets there. A *delimiter* marks the border of a scope, so that the copies of a λ keep their variables apart. Since nothing is copied before it has to be, a redex inside a shared function is reduced once, for all of its copies at the same time. At any point the net can be read back as an ordinary term.
+
+In the screenshot, the triangle is a fan and the half discs are delimiters. The fan is about to copy `λx`, the highlighted pair, while the redex `(λy. y) x` below it is stored once, even though the term read back from the net, under *Term*, has it twice.
+
+## Try it
+
+The web page needs the `wasm32-unknown-unknown` target and `wasm-pack`:
 
 ```
-λ> :compare 2 2 2 2 id id
-λx. x
-optimal:      27 β-steps, 1151 bookkeeping steps
-normal order: 258294 β-steps in 27 families
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
+scripts/build-web.sh
+python3 -m http.server --directory web 8000
 ```
 
-(`id` is `\x. x`, from `examples/prelude.lam`)
+Then open <http://localhost:8000>, pick an example, and press Step or Play.
 
-## Layout
-
-| Path | What it is |
-|---|---|
-| `crates/core` | The engine: terms, parser, scripts, nets, rules, machine, readback, garbage collection, and the reference reducer it is checked against. No dependencies. |
-| `crates/repl` | The `levy` binary, with the Graphviz export behind `:dot`. |
-| `crates/web` | The stepper behind the page, the placement of nets on it, and their WebAssembly bindings. |
-| `web/` | The page that draws the nets. |
-| `examples/prelude.lam` | Church encodings to play with. |
-
-## REPL
+The REPL needs only Cargo:
 
 ```
 cargo run --release -p levy -- examples/prelude.lam
@@ -35,6 +51,12 @@ Enter a term to reduce it, or `name = term` to define a name.
 λ> :trace (\f. f (f a)) (\x. (\y. y) x)
 λ> :help
 ```
+
+## The web page
+
+The page shows the net, the term it stands for, the pair of nodes about to interact, and counters. Arrow keys step forwards and backwards, space plays, `b` runs to the next β-step and `f` fits the net in view. Ctrl+Enter in the script loads it, and scripts can use every definition in `examples/prelude.lam`. Finish and Next β can be stopped by pressing them again. Scroll or pinch to zoom, drag to pan.
+
+## The REPL
 
 ### Syntax
 
@@ -72,19 +94,6 @@ With `-e TERM`, or when standard input is not a terminal, nothing is asked: resu
 ```
 levy examples/prelude.lam -e 'fact 5' -e ':compare fib 10'
 ```
-
-## Web page
-
-Building it needs the `wasm32-unknown-unknown` target and `wasm-pack`:
-
-```
-rustup target add wasm32-unknown-unknown
-cargo install wasm-pack
-scripts/build-web.sh
-python3 -m http.server --directory web 8000
-```
-
-Then open <http://localhost:8000>. The page shows the net, the term it stands for, the pair of nodes about to interact, and counters. Arrow keys step forwards and backwards, space plays, `b` runs to the next β-step and `f` fits the net in view. Ctrl+Enter in the script loads it, and scripts can use every definition in `examples/prelude.lam`. Finish and Next β can be stopped by pressing them again. Scroll or pinch to zoom, drag to pan.
 
 ## How it works
 
