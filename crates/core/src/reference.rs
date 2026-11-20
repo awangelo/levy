@@ -14,6 +14,7 @@
 //! fingerprint is possible in principle and negligible in practice.
 
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::rc::Rc;
 
 use crate::term::Term;
@@ -272,7 +273,7 @@ impl Labelled {
 
     /// Labels every subterm with an atom of its own.
     fn from_term(term: &Term, next_atom: &mut u64) -> Labelled {
-        let result: Result<Labelled, std::convert::Infallible> = rebuild(
+        let Ok(labelled): Result<Labelled, Infallible> = rebuild(
             term,
             |term| {
                 let label = Label::atom(*next_atom);
@@ -295,10 +296,7 @@ impl Labelled {
             Labelled::lam,
             Labelled::app,
         );
-        match result {
-            Ok(labelled) => labelled,
-            Err(never) => match never {},
-        }
+        labelled
     }
 
     fn into_term(self) -> Term {
@@ -310,16 +308,13 @@ impl Labelled {
                 Shape::App(func, arg) => Opened::App((), *func, *arg),
             })
         };
-        let result: Result<Term, std::convert::Infallible> = rebuild(
+        let Ok(term): Result<Term, Infallible> = rebuild(
             self,
             open,
             |name: Rc<str>, body| Term::lam(name.as_ref(), body),
             |(), func, arg| Term::app(func, arg),
         );
-        match result {
-            Ok(term) => term,
-            Err(never) => match never {},
-        }
+        term
     }
 }
 
