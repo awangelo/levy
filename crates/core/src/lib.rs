@@ -33,6 +33,7 @@ pub mod rules;
 pub mod script;
 pub mod term;
 pub mod translate;
+mod walk;
 
 pub use machine::{Halt, Machine, Redex, Stats};
 pub use parse::{ParseError, parse, parse_with};
