@@ -9,8 +9,8 @@
 //!    machine fires exactly one beta interaction per redex family;
 //! 3. no rule other than beta changes the term a net stands for;
 //! 4. it makes no difference whether a reduction runs in one go, one
-//!    interaction at a time, in slices of fuel, or with garbage collected
-//!    at every turn.
+//!    interaction at a time, in batches, in slices of fuel, or with garbage
+//!    collected at every turn.
 //!
 //! The random terms come from a fixed seed, so a failure can be reproduced.
 //! Set `LEVY_TEST_SEED` to a number to try other terms.
@@ -144,7 +144,7 @@ fn variant(machine: &Machine) -> Option<String> {
         Kind::Eraser => "eraser",
         Kind::Free { .. } => "free variable",
     };
-    let redex = machine.next().expect("the net is sound")?;
+    let redex = machine.next()?;
     let (upper, lower) = (
         machine.net().kind(redex.upper),
         machine.net().kind(redex.lower),
@@ -186,6 +186,8 @@ const VARIANTS: [&str; 14] = [
 /// interaction it sees.
 fn check_steps(term: &Term, normal: Option<&Term>, seen: &mut BTreeMap<String, u64>) {
     let mut machine = Machine::new(term).expect("the term has no unbound index");
+    // Up to the first pair, so that it can be announced.
+    assert_eq!(machine.advance(0, false, u64::MAX), Ok(None), "{term}");
     let mut current = term.clone();
     for _ in 0..400 {
         let Some(expected) = variant(&machine) else {
@@ -461,13 +463,21 @@ fn how_a_reduction_is_driven_makes_no_difference() {
             assert_eq!(stepped.readback(), outcome, "{term}");
         }
 
-        // In batches of uneven size, some of which stop at a beta.
+        // In batches of uneven size, some of which stop at a beta, and some
+        // of which have too little fuel to get to the end of the batch, or
+        // anywhere at all.
         let mut batched = machine();
         while batched.stats().interactions() < direct.stats().interactions() {
             let left = direct.stats().interactions() - batched.stats().interactions();
             let batch = 1 + random.below(40) as u64;
-            let fired = batched.advance(batch.min(left), random.below(3) == 0);
-            assert!(fired.unwrap().is_some(), "{term}");
+            let fuel = match random.below(3) {
+                0 => u64::MAX,
+                _ => 1 + random.below(120) as u64,
+            };
+            match batched.advance(batch.min(left), random.below(3) == 0, fuel) {
+                Ok(fired) => assert!(fired.is_some(), "{term}"),
+                Err(halt) => assert_eq!(halt, Halt::OutOfFuel, "{term}"),
+            }
         }
         assert_eq!(batched.stats(), direct.stats(), "{term}");
 

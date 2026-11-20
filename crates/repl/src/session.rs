@@ -22,8 +22,9 @@ const TRACE_LIMIT: u64 = 100;
 /// Work allowed for reading back one term of a trace. A term that takes
 /// more is too large to be worth printing.
 const TRACE_READ_FUEL: u64 = 40_000;
-/// Interactions `:trace` fires between two looks at the interrupt flag.
-const TRACE_STRETCH: u64 = 100_000;
+/// Work `:trace` lets one interaction do between two looks at the interrupt
+/// flag.
+const TRACE_STRETCH: u64 = 1_000_000;
 
 /// Where the session writes.
 pub trait Output {
@@ -251,24 +252,19 @@ impl Session {
         let mut machine = self.machine(term, out)?;
         out.line(&format!("  {}", show(term)));
         let mut shown = 0;
+        // What stopped the reduction, if it was not its end.
         let halt = loop {
             if out.is_closed() {
                 return Ok(());
             }
             if self.interrupted() {
-                break Halt::Interrupted;
+                break Some(Halt::Interrupted);
             }
-            let left = self.fuel.saturating_sub(machine.stats().interactions());
-            if left == 0 {
-                // The allowance is spent, which only matters if work is left.
-                match machine.next() {
-                    Ok(None) => break Halt::OutOfFuel,
-                    Ok(Some(_)) => return fail(out, &self.explain(Halt::OutOfFuel, &machine)),
-                    Err(halt) => return fail(out, &self.explain(halt, &machine)),
-                }
-            }
-            match machine.advance(left.min(TRACE_STRETCH), true) {
-                Ok(None) => break Halt::OutOfFuel,
+            // One interaction at a time, so that the fuel given bounds the
+            // call, and all the calls together spend no more than the limit.
+            let left = self.fuel.saturating_sub(machine.spent());
+            match machine.advance(1, false, left.min(TRACE_STRETCH)) {
+                Ok(None) => break None,
                 Ok(Some(Rule::Beta)) => {
                     if shown == TRACE_LIMIT {
                         out.line(&format!("stopped after {TRACE_LIMIT} β-steps"));
@@ -278,19 +274,22 @@ impl Session {
                     match machine.readback_within(TRACE_READ_FUEL) {
                         Ok(Some(reduct)) => out.line(&format!("β {}", show(&reduct))),
                         Ok(None) => out.line("β <a term too large to show>"),
-                        Err(halt) => break halt,
+                        Err(halt) => break Some(halt),
                     }
                 }
                 Ok(Some(_)) => {}
-                Err(halt) => break halt,
+                // Only the stretch is spent, not the limit.
+                Err(Halt::OutOfFuel) if left > TRACE_STRETCH => {}
+                Err(halt) => break Some(halt),
             }
         };
-        // Leaving the loop with the fuel untouched means the term is done.
-        if halt != Halt::OutOfFuel {
-            return fail(out, &self.explain(halt, &machine));
+        match halt {
+            Some(halt) => fail(out, &self.explain(halt, &machine)),
+            None => {
+                out.line(&steps(&machine));
+                Ok(())
+            }
         }
-        out.line(&steps(&machine));
-        Ok(())
     }
 
     fn load_file(&mut self, path: &str, out: &mut dyn Output) -> Result<(), Failed> {
@@ -642,26 +641,74 @@ mod tests {
     }
 
     #[test]
-    fn trace_finishes_when_its_limits_are_just_enough() {
-        // Three interactions, with fuel for exactly three.
+    fn trace_finishes_when_its_fuel_is_just_enough() {
+        // What evaluating the term spends, which is what tracing it spends
+        // as well.
+        let source = r"(\x. x) a";
+        let mut machine = Machine::new(&levy_core::parse(source).unwrap()).unwrap();
+        machine.normalize(u64::MAX).unwrap();
+        let needed = machine.spent();
         let mut session = session();
-        assert!(run(&mut session, ":fuel 3").is_empty());
-        let lines = run(&mut session, r":trace (\x. x) a");
+        assert!(run(&mut session, &format!(":fuel {needed}")).is_empty());
+        let lines = run(&mut session, &format!(":trace {source}"));
         assert_eq!(lines[1..], ["β a", "1 β-steps, 2 bookkeeping steps"]);
-        assert!(run(&mut session, ":fuel 2").is_empty());
-        let lines = run(&mut session, r":trace (\x. x) a");
+        // One unit less is not enough, and is not exceeded.
+        let short = needed - 1;
+        assert!(run(&mut session, &format!(":fuel {short}")).is_empty());
+        let lines = run(&mut session, &format!(":trace {source}"));
+        assert_eq!(lines[1], "β a");
         assert!(
-            lines[2].starts_with("no normal form within 2 steps"),
+            lines[2].starts_with(&format!("no normal form within {short} steps")),
             "{lines:?}"
         );
+        assert!(failed(&mut session, &format!(":trace {source}")));
+    }
+
+    #[test]
+    fn trace_needs_no_more_fuel_than_evaluation() {
+        // Reading on past the pair a step stopped at is not paid twice.
+        let mut session = session();
+        assert!(run(&mut session, ":fuel 51").is_empty());
+        let source = r"(\x. x x) (\x. x) ((\y. y) (\z. z)) w";
+        assert_eq!(run(&mut session, source)[0], "w");
+        let lines = run(&mut session, &format!(":trace {source}"));
+        assert_eq!(lines[5], "β w", "{lines:?}");
+        assert!(lines[6].starts_with("5 β-steps"), "{lines:?}");
+        assert!(run(&mut session, ":fuel 50").is_empty());
+        assert!(failed(&mut session, source));
+        assert!(failed(&mut session, &format!(":trace {source}")));
+    }
+
+    #[test]
+    fn trace_shows_no_more_than_a_hundred_beta_steps() {
         // A hundred beta-steps, the most a trace shows: two to apply the
         // numeral 98, and one per identity.
+        let mut session = session();
         assert!(run(&mut session, ":fuel 1_000_000").is_empty());
         let lines = run(&mut session, r":trace 98 (\x. x) a");
         assert_eq!(lines[100], "β a");
         assert!(lines[101].starts_with("100 β-steps"), "{lines:?}");
         let lines = run(&mut session, r":trace 99 (\x. x) a");
         assert_eq!(lines[101], "stopped after 100 β-steps");
+    }
+
+    #[test]
+    fn trace_stops_at_the_fuel_limit_when_the_result_is_too_large_to_read() {
+        // Forty doublings: a net of a few hundred nodes for a term of 2^41.
+        // The interactions are soon over, and the walk to the end of such a
+        // term never is.
+        let mut session = session();
+        assert!(run(&mut session, ":fuel 300_000").is_empty());
+        let lines = run(&mut session, r":trace 40 (\x. f x x) a");
+        assert_eq!(lines.len(), 44, "{lines:?}");
+        assert_eq!(lines[42], "β <a term too large to show>");
+        assert!(
+            lines[43]
+                .starts_with("no normal form within 300000 steps (247 interactions, 42 β-steps)"),
+            "{lines:?}"
+        );
+        // The same term evaluated stops at the same limit.
+        assert_eq!(run(&mut session, r"40 (\x. f x x) a"), lines[43..]);
     }
 
     #[test]

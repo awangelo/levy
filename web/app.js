@@ -439,8 +439,11 @@ function readout() {
   } else if (frame.next) {
     const [name, text] = RULES[frame.next.rule];
     ui.next.replaceChildren(Object.assign(document.createElement("strong"), { textContent: name }), `: ${text}`);
-  } else {
+  } else if (frame.normal) {
     ui.next.textContent = `Normal form reached after ${frame.step} interactions.`;
+  } else {
+    // The stepper looks only so far for the next interaction.
+    ui.next.textContent = `Stopped after ${frame.step} interactions: the term is too large to read on to the next one, or to its end.`;
   }
   const done = !frame.next;
   for (const button of [ui.step, ui.beta, ui.play, ui.finish]) button.disabled = done;

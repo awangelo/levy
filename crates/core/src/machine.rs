@@ -88,6 +88,33 @@ impl fmt::Display for Halt {
 
 impl std::error::Error for Halt {}
 
+/// Why a walk stopped before the end of the term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// It stands in front of an active pair that its policy may not rewrite.
+    /// Nothing is wrong, and the walk can go on from there.
+    Paused,
+    /// It cannot go on, for a reason to tell the caller.
+    Halt(Halt),
+}
+
+impl From<Halt> for Stop {
+    fn from(halt: Halt) -> Stop {
+        Stop::Halt(halt)
+    }
+}
+
+impl Stop {
+    /// The halt behind the stop of a walk that nothing held back from a
+    /// pair: one that rewrites nothing, or all it finds.
+    fn halt(self) -> Halt {
+        match self {
+            Stop::Halt(halt) => halt,
+            Stop::Paused => unreachable!("nothing held the walk back from a pair"),
+        }
+    }
+}
+
 /// An active pair the reduction is about to rewrite.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Redex {
@@ -109,6 +136,8 @@ const SMALLEST_COLLECTION: usize = 4_096;
 pub struct Machine {
     net: Net,
     stats: Stats,
+    /// The fuel that reducing has spent.
+    spent: u64,
     /// The size at which `normalize` collects garbage next.
     collect_at: usize,
     /// How far the reduction has got.
@@ -120,8 +149,9 @@ pub struct Machine {
 enum Progress {
     /// No walk is under way: the next one starts at the root.
     Idle,
-    /// A walk stopped half way, to be taken up again.
-    Suspended(Suspended),
+    /// A walk stopped half way, to be taken up again. Boxed, as it is many
+    /// times the size of the other states.
+    Suspended(Box<Suspended>),
     /// A walk has read the whole term and found nothing left to rewrite.
     /// Nothing changes the net from here on, so this is for good.
     Normal,
@@ -133,6 +163,7 @@ impl Machine {
         Ok(Machine {
             net: translate(term)?,
             stats: Stats::default(),
+            spent: 0,
             collect_at: SMALLEST_COLLECTION,
             progress: Progress::Idle,
         })
@@ -158,6 +189,21 @@ impl Machine {
         self.stats
     }
 
+    /// The fuel that reducing has spent so far, over all the calls that
+    /// reduced. With it, several calls can share one allowance. A walk pays
+    /// for each node once, however many calls it is taken up in, so a
+    /// reduction driven one interaction at a time spends what one call to
+    /// [`normalize`](Machine::normalize) does.
+    pub fn spent(&self) -> u64 {
+        self.spent
+    }
+
+    /// Whether a walk has read the whole term and found nothing left to
+    /// rewrite.
+    pub fn is_normal(&self) -> bool {
+        matches!(self.progress, Progress::Normal)
+    }
+
     /// Reduces to normal form and returns it.
     ///
     /// `fuel` bounds the work, and with it the time and the memory the call
@@ -178,54 +224,78 @@ impl Machine {
         fuel: u64,
         interrupted: &dyn Fn() -> bool,
     ) -> Result<Term, Halt> {
-        if matches!(self.progress, Progress::Normal) {
+        if self.is_normal() {
             // There is nothing left to rewrite, only the result to read.
-            let state = Suspended::at_root(&self.net);
-            let mut walker = Walker {
-                policy: &mut Observe(&self.net),
-                state,
-                fuel,
-                interrupted: Some(interrupted),
-            };
-            return walker.term();
+            return read(&self.net, fuel, Some(interrupted));
         }
-        self.reduce(u64::MAX, false, fuel, Some(interrupted)).0
+        let (outcome, _) = self.reduce(u64::MAX, false, fuel, None, Some(interrupted));
+        outcome.map_err(Stop::halt)
     }
 
-    /// Fires the next interaction of the reduction and reports its rule, or
-    /// returns `None` if the net is in normal form.
+    /// Fires the next interaction and reports its rule, or returns `None` if
+    /// the net is in normal form.
+    ///
+    /// Nothing bounds the walk from that interaction to the next, which can
+    /// be as long as the term the net stands for is large. Use
+    /// [`advance`](Machine::advance) to bound it.
     pub fn step(&mut self) -> Result<Option<Rule>, Halt> {
-        self.advance(1, false)
+        self.advance(1, false, u64::MAX)
     }
 
     /// Fires up to `interactions` interactions, and with `until_beta` stops
     /// after the first beta among them. Reports the rule fired last, or
-    /// `None` if the net was in normal form already.
+    /// `None` if none fired: the net was in normal form already, or no
+    /// interaction was allowed.
     ///
-    /// The walk stops in front of the next pair and goes on from there in
-    /// the next call, so stepping costs no more than running.
-    pub fn advance(&mut self, interactions: u64, until_beta: bool) -> Result<Option<Rule>, Halt> {
-        if matches!(self.progress, Progress::Normal) {
+    /// After an interaction the walk goes on to the pair that comes next and
+    /// stops in front of it, so stepping costs no more than running, and
+    /// [`next`](Machine::next) names that pair. Allowed no interactions, the
+    /// call does only that.
+    ///
+    /// `fuel` is what one interaction may spend, counted as for
+    /// [`normalize`](Machine::normalize): on the way to its pair, on the
+    /// pair, and on the way to the pair after. A call that allows one
+    /// interaction is bounded by it as a whole. One that allows more does
+    /// what as many calls that allow one would do, up to the first whose
+    /// walk stops short of the next pair, so where the walk stands after an
+    /// interaction does not depend on how many were asked for at once. If
+    /// the fuel runs out before anything has fired, the call returns
+    /// [`Halt::OutOfFuel`], and a later call goes on from there.
+    pub fn advance(
+        &mut self,
+        interactions: u64,
+        until_beta: bool,
+        fuel: u64,
+    ) -> Result<Option<Rule>, Halt> {
+        if self.is_normal() {
             return Ok(None);
         }
-        match self.reduce(interactions, until_beta, u64::MAX, None) {
-            (Ok(_) | Err(Halt::OutOfFuel), last) => Ok(last),
-            (Err(halt), _) => Err(halt),
+        // An interaction with a call to itself pays for its pair out of the
+        // fuel of that call and goes on with the rest. In a call it shares,
+        // the walk has paid for the pair by the time it fires.
+        let refill = Some(fuel.saturating_sub(1));
+        match self.reduce(interactions, until_beta, fuel, refill, None) {
+            (Ok(_) | Err(Stop::Paused), last) => Ok(last),
+            (Err(Stop::Halt(Halt::OutOfFuel)), last @ Some(_)) => Ok(last),
+            (Err(Stop::Halt(halt)), _) => Err(halt),
         }
     }
 
     /// Takes up the walk where it stopped, or starts one at the root, and
-    /// rewrites what it comes across within the limits given. Returns what
-    /// became of the walk, and the rule fired last.
+    /// rewrites what it comes across within the limits given. `refill` is
+    /// the fuel the walk has after each rewrite but its first, if it is not
+    /// to make do with `fuel`. Returns what became of the walk, and the rule
+    /// fired last.
     fn reduce(
         &mut self,
         interactions: u64,
         until_beta: bool,
         fuel: u64,
+        refill: Option<u64>,
         interrupted: Option<&dyn Fn() -> bool>,
-    ) -> (Result<Term, Halt>, Option<Rule>) {
+    ) -> (Result<Term, Stop>, Option<Rule>) {
         let state = match std::mem::replace(&mut self.progress, Progress::Idle) {
-            Progress::Suspended(state) => state,
+            Progress::Suspended(state) => *state,
             Progress::Idle | Progress::Normal => Suspended::at_root(&self.net),
         };
         let mut reduce = Reduce {
@@ -235,55 +305,47 @@ impl Machine {
             last: None,
         };
         let mut walker = Walker {
-            policy: &mut reduce,
-            state,
-            fuel,
-            interrupted,
+            refill,
+            ..Walker::new(&mut reduce, state, fuel, interrupted)
         };
         let outcome = walker.term();
+        let spent = fuel - walker.fuel + walker.refilled;
         let state = walker.state;
         let last = reduce.last;
-        // A walk that only ran out of allowance stands in front of a node it
+        self.spent += spent;
+        // A walk that stopped short of the end stands in front of a node it
         // has not looked at yet, and nothing but the walk itself changes the
         // net in the meantime, so it can go on from there.
         self.progress = match outcome {
-            Err(Halt::OutOfFuel | Halt::Interrupted) => Progress::Suspended(state),
             Ok(_) => Progress::Normal,
-            Err(Halt::Malformed(_)) => Progress::Idle,
+            Err(Stop::Halt(Halt::Malformed(_))) => Progress::Idle,
+            Err(_) => Progress::Suspended(Box::new(state)),
         };
         (outcome, last)
     }
 
-    /// The active pair that `step` would rewrite, or `None` if the net is in
-    /// normal form.
-    pub fn next(&self) -> Result<Option<Redex>, Halt> {
-        if matches!(self.progress, Progress::Normal) {
-            return Ok(None);
-        }
-        // A walk that stopped for want of allowance stands in front of the
-        // very pair it would have rewritten next.
-        if let Progress::Suspended(Suspended { top, .. }) = &self.progress {
-            let (upper, lower) = (*top, self.net.peer(*top));
-            if upper.is_principal()
-                && lower.is_principal()
-                && let Some(rule) =
-                    rules::rule_for(self.net.kind(upper.node), self.net.kind(lower.node))
-            {
-                return Ok(Some(Redex {
-                    upper: upper.node,
-                    lower: lower.node,
-                    rule,
-                }));
-            }
-        }
-        let mut scout = Scout {
-            net: &self.net,
-            found: None,
+    /// The active pair the reduction stands in front of: the one its next
+    /// interaction rewrites.
+    ///
+    /// `None` once the net is in normal form, and also while that pair is
+    /// still to be found: before the first call that reduces, and after one
+    /// whose fuel ran out on the way there. [`is_normal`](Machine::is_normal)
+    /// tells the two apart, and [`advance`](Machine::advance) finds the pair,
+    /// even when it is allowed no interactions.
+    pub fn next(&self) -> Option<Redex> {
+        let Progress::Suspended(state) = &self.progress else {
+            return None;
         };
-        match read(&mut scout, u64::MAX) {
-            Ok(_) | Err(Halt::OutOfFuel) => Ok(scout.found),
-            Err(halt) => Err(halt),
+        let (upper, lower) = (state.top, self.net.peer(state.top));
+        if !(upper.is_principal() && lower.is_principal()) {
+            return None;
         }
+        let rule = rules::rule_for(self.net.kind(upper.node), self.net.kind(lower.node))?;
+        Some(Redex {
+            upper: upper.node,
+            lower: lower.node,
+            rule,
+        })
     }
 
     /// The term the net stands for right now.
@@ -298,7 +360,7 @@ impl Machine {
     /// more than `fuel` units of work, counted as in
     /// [`normalize`](Machine::normalize).
     pub fn readback_within(&self, fuel: u64) -> Result<Option<Term>, Halt> {
-        match read(&mut Observe(&self.net), fuel) {
+        match read(&self.net, fuel, None) {
             Ok(term) => Ok(Some(term)),
             Err(Halt::OutOfFuel) => Ok(None),
             Err(halt) => Err(halt),
@@ -317,7 +379,7 @@ impl Machine {
 
 /// Reads a net as a term without rewriting anything.
 pub fn readback(net: &Net) -> Result<Term, Halt> {
-    read(&mut Observe(net), u64::MAX)
+    read(net, u64::MAX, None)
 }
 
 /// What a walk does with the active pairs it comes across.
@@ -325,8 +387,9 @@ trait Policy {
     fn net(&self) -> &Net;
 
     /// Rewrites the pair if it interacts and this policy reduces. Reports
-    /// whether the net changed.
-    fn fire(&mut self, upper: NodeId, lower: NodeId) -> Result<bool, Halt>;
+    /// whether the net changed, or stops the walk in front of a pair that
+    /// interacts and that this policy may not rewrite.
+    fn fire(&mut self, upper: NodeId, lower: NodeId) -> Result<bool, Stop>;
 
     /// Merges into the delimiter at `exit` the one stacked on it, if there is
     /// one and this policy reduces. Returns the level and the height of what
@@ -344,31 +407,8 @@ impl Policy for Observe<'_> {
         self.0
     }
 
-    fn fire(&mut self, _upper: NodeId, _lower: NodeId) -> Result<bool, Halt> {
+    fn fire(&mut self, _upper: NodeId, _lower: NodeId) -> Result<bool, Stop> {
         Ok(false)
-    }
-}
-
-/// Rewrites nothing, and stops at the first pair that could be rewritten: a
-/// reducer with no allowance that remembers what it wanted to rewrite.
-struct Scout<'a> {
-    net: &'a Net,
-    found: Option<Redex>,
-}
-
-impl Policy for Scout<'_> {
-    fn net(&self) -> &Net {
-        self.net
-    }
-
-    fn fire(&mut self, upper: NodeId, lower: NodeId) -> Result<bool, Halt> {
-        match rules::rule_for(self.net.kind(upper), self.net.kind(lower)) {
-            Some(rule) => {
-                self.found = Some(Redex { upper, lower, rule });
-                Err(Halt::OutOfFuel)
-            }
-            None => Ok(false),
-        }
     }
 }
 
@@ -387,7 +427,7 @@ impl Policy for Reduce<'_> {
         &self.machine.net
     }
 
-    fn fire(&mut self, upper: NodeId, lower: NodeId) -> Result<bool, Halt> {
+    fn fire(&mut self, upper: NodeId, lower: NodeId) -> Result<bool, Stop> {
         let net = &mut self.machine.net;
         let Some(rule) = rules::rule_for(net.kind(upper), net.kind(lower)) else {
             return Ok(false);
@@ -395,7 +435,7 @@ impl Policy for Reduce<'_> {
         // The walk stops at the pair it may not rewrite, not right after the
         // last one it did: the delimiters in between are merged by then, so
         // the next walk finds the net as `next` describes it.
-        self.interactions = self.interactions.checked_sub(1).ok_or(Halt::OutOfFuel)?;
+        self.interactions = self.interactions.checked_sub(1).ok_or(Stop::Paused)?;
         rules::rewrite(net, rule, upper, lower);
         self.machine.stats.record(rule);
         self.last = Some(rule);
@@ -415,16 +455,12 @@ impl Policy for Reduce<'_> {
     }
 }
 
-/// Reads the term a net stands for from the root, spending at most `fuel`.
-fn read(policy: &mut impl Policy, fuel: u64) -> Result<Term, Halt> {
-    let state = Suspended::at_root(policy.net());
-    let mut walker = Walker {
-        policy,
-        state,
-        fuel,
-        interrupted: None,
-    };
-    walker.term()
+/// Reads the term a net stands for from the root, without rewriting
+/// anything and spending at most `fuel`.
+fn read(net: &Net, fuel: u64, interrupted: Option<&dyn Fn() -> bool>) -> Result<Term, Halt> {
+    let mut observe = Observe(net);
+    let mut walker = Walker::new(&mut observe, Suspended::at_root(net), fuel, interrupted);
+    walker.term().map_err(Stop::halt)
 }
 
 /// A point passed on the way down: the port the walk left a node by, and the
@@ -492,18 +528,48 @@ struct Walker<'a, P> {
     state: Suspended,
     /// How many more nodes the walk may come to.
     fuel: u64,
+    /// The fuel the walk has after each rewrite but its first. With it, the
+    /// fuel bounds what one interaction spends, as [`Machine::advance`] has
+    /// it. Without, it bounds the walk as a whole.
+    refill: Option<u64>,
+    /// Whether the walk has rewritten a pair.
+    rewrote: bool,
+    /// How many nodes the walk has paid for. Unlike the fuel, which refills
+    /// put back up, this says when to ask whether to give up.
+    walked: u64,
+    /// How much fuel the refills have added to what the walk started with.
+    refilled: u64,
     /// Asked now and then whether to give up.
     interrupted: Option<&'a dyn Fn() -> bool>,
 }
 
-impl<P: Policy> Walker<'_, P> {
+impl<'a, P: Policy> Walker<'a, P> {
+    /// A walk that goes on from `state` and has `fuel` for all of it.
+    fn new(
+        policy: &'a mut P,
+        state: Suspended,
+        fuel: u64,
+        interrupted: Option<&'a dyn Fn() -> bool>,
+    ) -> Self {
+        Walker {
+            policy,
+            state,
+            fuel,
+            refill: None,
+            rewrote: false,
+            walked: 0,
+            refilled: 0,
+            interrupted,
+        }
+    }
+
     /// Reads the term from where the walk stands.
     ///
     /// The term can be nested deeper than any call stack, so what is left to
     /// do is kept in a list, not in recursive calls. That list is also what
-    /// lets a walk that ran out of fuel be taken up again: an error leaves
-    /// the state in front of the node it stopped at.
-    fn term(&mut self) -> Result<Term, Halt> {
+    /// lets a walk that stopped be taken up again: a stop leaves the state in
+    /// front of the node it happened at.
+    fn term(&mut self) -> Result<Term, Stop> {
         loop {
             let head = self.head()?;
             let state = &mut self.state;
@@ -559,16 +625,35 @@ impl<P: Policy> Walker<'_, P> {
     /// the active pairs on the way if the policy does. Returns the head,
     /// leaves the context as it is there, and adds the applications passed
     /// to what is pending, the outermost first.
-    fn head(&mut self) -> Result<Head, Halt> {
+    fn head(&mut self) -> Result<Head, Stop> {
         let head = loop {
             self.spend()?;
             let state = &mut self.state;
             let top = state.top;
             let entry = self.policy.net().peer(top);
-            if top.is_principal()
-                && entry.is_principal()
-                && self.policy.fire(top.node, entry.node)?
-            {
+            let fired = if top.is_principal() && entry.is_principal() {
+                match self.policy.fire(top.node, entry.node) {
+                    Err(Stop::Paused) => {
+                        // The walk stops in front of the pair and pays for
+                        // it when it goes on.
+                        self.fuel += 1;
+                        return Err(Stop::Paused);
+                    }
+                    fired => fired?,
+                }
+            } else {
+                false
+            };
+            if fired {
+                if std::mem::replace(&mut self.rewrote, true)
+                    && let Some(fuel) = self.refill
+                {
+                    // An interaction after the first has fuel of its own. The
+                    // walk was left no more than this by the one before, so
+                    // nothing is taken from it.
+                    self.refilled += fuel - self.fuel;
+                    self.fuel = fuel;
+                }
                 // The node of the top frame is gone. Whatever replaced it
                 // hangs from the frame before, so resume there. The starting
                 // frame is only ever the root, which survives.
@@ -615,13 +700,17 @@ impl<P: Policy> Walker<'_, P> {
                     node.principal()
                 }
                 (Kind::Lam { .. }, _) => {
-                    return Err(Halt::Malformed("an abstraction is entered from its body"));
+                    return Err(Halt::Malformed("an abstraction is entered from its body").into());
                 }
                 (Kind::App, _) => {
-                    return Err(Halt::Malformed("an application is entered from below"));
+                    return Err(Halt::Malformed("an application is entered from below").into());
                 }
-                (Kind::Eraser, _) => return Err(Halt::Malformed("the walk ran into an eraser")),
-                (Kind::Root, _) => return Err(Halt::Malformed("the walk came back to the root")),
+                (Kind::Eraser, _) => {
+                    return Err(Halt::Malformed("the walk ran into an eraser").into());
+                }
+                (Kind::Root, _) => {
+                    return Err(Halt::Malformed("the walk came back to the root").into());
+                }
             };
             state.passed.push(Frame { exit: top, mark });
             state.top = next;
@@ -648,15 +737,16 @@ impl<P: Policy> Walker<'_, P> {
         Ok(head)
     }
 
-    /// Pays for one node the walk comes to.
+    /// Pays for one node the walk comes to, unless it is to give up first.
     fn spend(&mut self) -> Result<(), Halt> {
-        self.fuel = self.fuel.checked_sub(1).ok_or(Halt::OutOfFuel)?;
-        if self.fuel.is_multiple_of(crate::INTERRUPT_CHECK)
+        if self.walked.is_multiple_of(crate::INTERRUPT_CHECK)
             && let Some(interrupted) = self.interrupted
             && interrupted()
         {
             return Err(Halt::Interrupted);
         }
+        self.fuel = self.fuel.checked_sub(1).ok_or(Halt::OutOfFuel)?;
+        self.walked += 1;
         Ok(())
     }
 }
@@ -808,7 +898,7 @@ mod tests {
         let expected = direct.normalize(1_000_000).unwrap();
         let mut stepped = machine(source);
         let mut betas = 0;
-        while let Some(rule) = stepped.advance(u64::MAX, true).unwrap() {
+        while let Some(rule) = stepped.advance(u64::MAX, true, u64::MAX).unwrap() {
             // Only the last stretch, to the normal form, may end without one.
             if rule == Rule::Beta {
                 betas += 1;
@@ -819,8 +909,145 @@ mod tests {
         assert_eq!(stepped.readback(), Ok(expected));
         // A limit on the interactions is kept as well.
         let mut limited = machine(source);
-        assert!(limited.advance(3, false).unwrap().is_some());
+        assert!(limited.advance(3, false, u64::MAX).unwrap().is_some());
         assert_eq!(limited.stats().interactions(), 3);
+    }
+
+    #[test]
+    fn fuel_bounds_the_walk_from_one_interaction_to_the_next() {
+        // Forty doublings: a net of a few hundred nodes for a term of 2^41.
+        // Before long nothing is left to rewrite, but only reading the whole
+        // term would tell.
+        let mut machine = machine(r"40 (\x. f x x) a");
+        let mut calls = 0;
+        let halt = loop {
+            calls += 1;
+            match machine.advance(1, false, 10_000) {
+                Ok(Some(_)) => assert_eq!(machine.stats().interactions(), calls),
+                other => break other,
+            }
+        };
+        // The call that fired nothing says that its fuel is gone.
+        assert_eq!(halt, Err(Halt::OutOfFuel));
+        assert_eq!(machine.stats().beta, 42);
+        assert!(machine.next().is_none() && !machine.is_normal());
+        assert!(machine.spent() <= calls * 10_000, "{}", machine.spent());
+        // The walk goes on from where it stopped, as far as it is let.
+        let spent = machine.spent();
+        assert_eq!(machine.advance(1, false, 500), Err(Halt::OutOfFuel));
+        assert_eq!(machine.spent(), spent + 500);
+        assert_eq!(machine.net().check(), Ok(()));
+    }
+
+    #[test]
+    fn a_batch_leaves_the_machine_where_single_interactions_do() {
+        // The net, the walk and the fuel spent.
+        let state = |machine: &Machine| {
+            let net = &machine.net;
+            let nodes: Vec<_> = net
+                .nodes()
+                .map(|(id, kind)| (id, kind, net.serial(id)))
+                .collect();
+            let wires: Vec<_> = net.wires().collect();
+            format!(
+                "{nodes:?} {wires:?} {:?} {}",
+                machine.progress, machine.spent
+            )
+        };
+        for (source, fuel) in [
+            (r"40 (\x. f x x) a", 10_000),
+            (r"(\f. f (f (\x. x))) (\g. g (\y. y))", u64::MAX),
+            (r"2 2 2 2", 1_000),
+        ] {
+            let mut single = machine(source);
+            let mut batched = machine(source);
+            for batch in [1, 2, 3, 5, 8, 13, 400, 100_000, 7] {
+                let fired = batched.advance(batch, false, fuel);
+                let mut singly = || {
+                    let mut last = None;
+                    for done in 0..batch {
+                        // One call does not send on a walk that it saw stop
+                        // short of the next pair.
+                        if done > 0 && single.next().is_none() {
+                            break;
+                        }
+                        match single.advance(1, false, fuel)? {
+                            Some(rule) => last = Some(rule),
+                            None => break,
+                        }
+                    }
+                    Ok(last)
+                };
+                assert_eq!(fired, singly(), "{source}: a batch of {batch}");
+                assert_eq!(batched.stats(), single.stats(), "{source}: {batch}");
+                assert_eq!(state(&batched), state(&single), "{source}: {batch}");
+            }
+        }
+    }
+
+    #[test]
+    fn one_interaction_at_a_time_spends_what_running_does() {
+        for source in [
+            r"(\x. x x) (\x. x) ((\y. y) (\z. z)) w",
+            r"(\f. f (f (\x. x))) (\g. g (\y. y))",
+            r"2 2 2 2",
+        ] {
+            let mut direct = machine(source);
+            let expected = direct.normalize(u64::MAX).unwrap();
+            let mut stepped = machine(source);
+            while stepped.step().unwrap().is_some() {}
+            assert_eq!(stepped.spent(), direct.spent(), "{source}");
+            // Exactly that much is enough, one interaction at a time too.
+            let mut budgeted = machine(source);
+            let fuel = direct.spent();
+            loop {
+                let left = fuel - budgeted.spent();
+                if budgeted.advance(1, false, left).unwrap().is_none() {
+                    break;
+                }
+            }
+            assert!(budgeted.is_normal(), "{source}");
+            assert_eq!(budgeted.spent(), fuel, "{source}");
+            assert_eq!(budgeted.readback(), Ok(expected), "{source}");
+        }
+    }
+
+    #[test]
+    fn an_interrupt_is_seen_however_the_fuel_is_refilled() {
+        // Each interaction of this term walks a few nodes, after which a
+        // refill puts the fuel back to one short of a multiple of the
+        // interval between two looks at the interrupt.
+        let mut machine = machine(r"(\x. x x) (\x. x x)");
+        let fuel = 10 * crate::INTERRUPT_CHECK - 1;
+        let interrupted = || true;
+        let (outcome, _) = machine.reduce(100_000, false, fuel, Some(fuel), Some(&interrupted));
+        assert_eq!(outcome, Err(Stop::Halt(Halt::Interrupted)));
+        assert!(machine.stats().interactions() < crate::INTERRUPT_CHECK);
+        assert_eq!(machine.net().check(), Ok(()));
+    }
+
+    #[test]
+    fn fuel_that_runs_out_after_an_interaction_stops_the_walk_short() {
+        let source = r"(\f. f (f (\x. x))) (\g. g (\y. y))";
+        let mut direct = machine(source);
+        let expected = direct.normalize(1_000_000).unwrap();
+        // Too little fuel to get from one pair to the next in one call.
+        let mut starved = machine(source);
+        let (mut fired, mut short) = (0, 0);
+        loop {
+            match starved.advance(1, false, 2) {
+                Ok(Some(_)) => {
+                    fired += 1;
+                    short += u64::from(starved.next().is_none() && !starved.is_normal());
+                }
+                Ok(None) => break,
+                Err(halt) => assert_eq!(halt, Halt::OutOfFuel),
+            }
+        }
+        assert!(short > 0, "no call stopped short of the next pair");
+        assert_eq!(fired, direct.stats().interactions());
+        assert_eq!(starved.stats(), direct.stats());
+        assert_eq!(starved.readback(), Ok(expected));
     }
 
     #[test]
@@ -831,15 +1058,16 @@ mod tests {
         // None of these walks the 131,075 nodes of the result again.
         for _ in 0..100_000 {
             assert_eq!(machine.step(), Ok(None));
-            assert_eq!(machine.next(), Ok(None));
+            assert_eq!(machine.next(), None);
         }
-        assert_eq!(machine.advance(u64::MAX, true), Ok(None));
+        assert!(machine.is_normal());
+        assert_eq!(machine.advance(u64::MAX, true, 0), Ok(None));
         assert_eq!(machine.stats(), stats);
         // The result is still there for the asking, within the fuel given.
         assert_eq!(machine.normalize(10), Err(Halt::OutOfFuel));
         assert_eq!(machine.normalize(10_000_000), Ok(term));
         machine.collect();
-        assert_eq!(machine.next(), Ok(None));
+        assert_eq!(machine.next(), None);
     }
 
     #[test]
@@ -852,14 +1080,20 @@ mod tests {
     #[test]
     fn next_names_the_pair_that_step_rewrites() {
         let mut machine = machine(r"(\x. x) y");
-        let redex = machine.next().unwrap().expect("the term has a redex");
+        // No walk has looked for the first pair yet. One that may fire
+        // nothing goes up to it.
+        assert!(machine.next().is_none() && !machine.is_normal());
+        assert_eq!(machine.advance(0, false, u64::MAX), Ok(None));
+        assert_eq!(machine.stats().interactions(), 0);
+        let redex = machine.next().expect("the term has a redex");
         assert_eq!(redex.rule, Rule::Beta);
         assert_eq!(machine.net().kind(redex.upper), Kind::App);
         assert!(matches!(machine.net().kind(redex.lower), Kind::Lam { .. }));
         assert_eq!(machine.step(), Ok(Some(Rule::Beta)));
-        while let Some(redex) = machine.next().unwrap() {
+        while let Some(redex) = machine.next() {
             assert_eq!(machine.step(), Ok(Some(redex.rule)));
         }
+        assert!(machine.is_normal());
         assert_eq!(machine.step(), Ok(None));
         assert_eq!(machine.readback(), Ok(Term::free("y")));
     }

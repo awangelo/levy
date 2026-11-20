@@ -27,14 +27,15 @@ impl Session {
     }
 
     /// Fires one interaction. Returns the name of its rule, or nothing if
-    /// the net is in normal form.
+    /// none fired: see [`run`](Session::run).
     pub fn step(&mut self) -> Result<Option<String>, JsError> {
         self.run(1, false)
     }
 
     /// Fires up to `interactions` interactions in one go, stopping after the
     /// first beta among them if `until_beta`. Returns the name of the rule
-    /// fired last, or nothing if the net was in normal form already.
+    /// fired last, or nothing if none fired: the net is in normal form, or
+    /// its next interaction is out of reach, and the frame says which.
     pub fn run(&mut self, interactions: u32, until_beta: bool) -> Result<Option<String>, JsError> {
         let fired = self
             .stepper

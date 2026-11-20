@@ -16,6 +16,10 @@ const PRINT_LIMIT: usize = 600;
 const READ_FUEL: u64 = 10_000;
 /// What the frame says in place of a term that takes more than that.
 const TOO_LARGE: &str = "<a term too large to show>";
+/// Work allowed for one interaction and the walk from it to the next, or to
+/// the end of the term if there is none. Past the last interaction that is
+/// the whole term, which is too much to walk if the term is too large.
+const SEARCH_FUEL: u64 = 1_000_000;
 /// The most nodes a term may have, its definitions expanded, for the page to
 /// load it. Definitions are expanded, so a script of a few lines can stand
 /// for a term too large to build, and building it comes before any fuel is
@@ -92,8 +96,13 @@ pub struct Frame {
     /// The picture. Empty if the net has more nodes than were asked for.
     pub nodes: Vec<NodeView>,
     pub wires: Vec<WireView>,
-    /// `None` once the net is in normal form.
+    /// `None` if the net is in normal form, and also if its next
+    /// interaction is out of reach: `normal` tells which.
     pub next: Option<NextView>,
+    /// Whether the net is in normal form. With neither this nor `next`, the
+    /// stepper stops: it has looked as far as it looks for an interaction,
+    /// or for the end of the term, and has found neither.
+    pub normal: bool,
     /// Whether stepping back is possible.
     pub can_go_back: bool,
     /// Set if the net stopped making sense, which would be a bug.
@@ -131,6 +140,9 @@ pub struct Stepper {
     /// How many places for nodes the snapshots may hold between them, as
     /// [`Machine::slots`] counts them.
     snapshot_slots: usize,
+    /// What a step found wrong with the net, if one did. The machine cannot
+    /// go on from there, so nothing fires until the reduction goes back.
+    failure: Option<Halt>,
 }
 
 /// The definitions every script starts with: those of the REPL's prelude,
@@ -160,7 +172,14 @@ impl Stepper {
                  more than the {LARGEST_TERM} the page takes"
             ));
         }
-        let machine = Machine::new(term).map_err(|error| error.to_string())?;
+        let mut machine = Machine::new(term).map_err(|error| error.to_string())?;
+        // Every state the stepper keeps stands in front of the pair it
+        // rewrites next, and so must the first. If that pair is out of
+        // reach, there is nothing to step through.
+        match machine.advance(0, false, SEARCH_FUEL) {
+            Ok(_) | Err(Halt::OutOfFuel) => {}
+            Err(halt) => return Err(halt.to_string()),
+        }
         Ok(Stepper {
             snapshots: VecDeque::from([machine.clone()]),
             initial: machine.clone(),
@@ -168,6 +187,7 @@ impl Stepper {
             stretches: VecDeque::new(),
             since: Vec::new(),
             snapshot_slots: SNAPSHOT_SLOTS,
+            failure: None,
         })
     }
 
@@ -177,18 +197,24 @@ impl Stepper {
     }
 
     /// Fires the next interaction and collects the garbage it leaves.
-    /// Returns its rule, or `None` if the net is in normal form.
+    /// Returns its rule, or `None` if none fired: see
+    /// [`advance`](Stepper::advance).
     pub fn step(&mut self) -> Result<Option<Rule>, Halt> {
         self.advance(1, false)
     }
 
     /// Fires up to `interactions` interactions as one operation, stopping
     /// after the first beta among them if `until_beta`, and collects the
-    /// garbage they leave. Returns the rule fired last, or `None` if the net
-    /// was in normal form already.
+    /// garbage they leave. Returns the rule fired last, or `None` if none
+    /// fired: the net is in normal form, or its next interaction is out of
+    /// reach. Once the net is found malformed, says so again on every call
+    /// until the reduction goes back.
     pub fn advance(&mut self, interactions: u64, until_beta: bool) -> Result<Option<Rule>, Halt> {
+        if let Some(halt) = self.failure {
+            return Err(halt);
+        }
         let before = self.steps();
-        let outcome = self.current.advance(interactions, until_beta);
+        let outcome = run(&mut self.current, interactions, until_beta);
         let fired = self.steps() - before;
         if fired > 0 {
             self.current.collect();
@@ -196,6 +222,9 @@ impl Stepper {
             if self.since.len() >= OPERATIONS_PER_SNAPSHOT {
                 self.snapshot();
             }
+        }
+        if let Err(halt) = outcome {
+            self.failure = Some(halt);
         }
         outcome
     }
@@ -259,6 +288,7 @@ impl Stepper {
         }
         replay(&mut machine, &self.since);
         self.current = machine;
+        self.failure = None;
         true
     }
 
@@ -268,6 +298,7 @@ impl Stepper {
         self.snapshots = VecDeque::from([self.initial.clone()]);
         self.stretches.clear();
         self.since.clear();
+        self.failure = None;
     }
 
     /// The current point of the reduction, ready to be drawn. The picture is
@@ -275,14 +306,10 @@ impl Stepper {
     pub fn frame(&self, max_nodes: usize) -> Frame {
         let net = self.current.net();
         let stats = self.current.stats();
-        let (term, read_error) = match self.current.readback_within(READ_FUEL) {
+        let (term, error) = match self.current.readback_within(READ_FUEL) {
             Ok(Some(term)) => (term.abbreviated(PRINT_LIMIT), None),
             Ok(None) => (TOO_LARGE.to_owned(), None),
             Err(halt) => (String::new(), Some(halt.to_string())),
-        };
-        let (next, next_error) = match self.current.next() {
-            Ok(next) => (next, None),
-            Err(halt) => (None, Some(halt.to_string())),
         };
         let diagram = if net.len() <= max_nodes {
             layout(net)
@@ -319,15 +346,34 @@ impl Stepper {
                     }
                 })
                 .collect(),
-            next: next.map(|redex| NextView {
+            next: self.current.next().map(|redex| NextView {
                 upper: id(net, redex.upper),
                 lower: id(net, redex.lower),
                 rule: rule_name(redex.rule),
             }),
+            normal: self.current.is_normal(),
             can_go_back: self.can_go_back(),
-            error: read_error.or(next_error),
+            error: self.failure.map(|halt| halt.to_string()).or(error),
         }
     }
+}
+
+/// Fires up to `interactions` interactions of `machine`, stopping after the
+/// first beta among them if `until_beta`. Returns the rule fired last, if
+/// any fired.
+///
+/// Each interaction has `SEARCH_FUEL` of its own. Where the machine stands
+/// after an interaction then depends on that interaction alone, not on how
+/// many were asked for at once, so going back can do them again in batches
+/// of any size.
+fn run(machine: &mut Machine, interactions: u64, until_beta: bool) -> Result<Option<Rule>, Halt> {
+    // With no pair in front there is nothing to fire: the net is in normal
+    // form, or the pair that comes next is out of reach. Looking further
+    // would move the machine without a step to go back over.
+    if machine.next().is_none() {
+        return Ok(None);
+    }
+    machine.advance(interactions, until_beta, SEARCH_FUEL)
 }
 
 /// Does again the operations of `stretch`, each with the collection that
@@ -335,7 +381,7 @@ impl Stepper {
 fn replay(machine: &mut Machine, stretch: &[u64]) {
     for &fired in stretch {
         // What worked once works again, the machine being the same.
-        if machine.advance(fired, false).is_err() {
+        if run(machine, fired, false).is_err() {
             break;
         }
         machine.collect();
@@ -438,6 +484,7 @@ mod tests {
         assert_eq!(frame.step, 0);
         assert!(!frame.can_go_back);
         assert_eq!(frame.next.map(|next| next.rule), Some("beta"));
+        assert!(!frame.normal);
         assert_eq!(frame.error, None);
     }
 
@@ -465,6 +512,7 @@ mod tests {
         assert_eq!(frame.term, "λx x1. x (x (x (x x1)))");
         assert_eq!(frame.step, steps);
         assert_eq!(frame.next, None);
+        assert!(frame.normal);
         assert!(frame.can_go_back);
     }
 
@@ -655,7 +703,56 @@ mod tests {
         let frame = stepper.frame(10);
         assert!(frame.size > 10);
         assert!(frame.nodes.is_empty() && frame.wires.is_empty());
+        // A result of 131,075 nodes is within reach: it was read to its end.
         assert_eq!(frame.next, None);
+        assert!(frame.normal);
+    }
+
+    #[test]
+    fn a_result_too_large_to_read_stops_the_stepper() {
+        // Forty doublings: a net of a few hundred nodes for a term of 2^41.
+        // After the last interaction only reading all of it would tell that
+        // it was the last.
+        let mut stepper = Stepper::load("40 (\\x. f x x) a").unwrap();
+        while stepper.advance(1 << 20, false).unwrap().is_some() {}
+        let end = stepper.frame(ALL);
+        assert_eq!((end.next.as_ref(), end.normal), (None, false));
+        assert_eq!(end.stats.beta, 42);
+        assert_eq!(end.term, TOO_LARGE);
+        assert_eq!(end.error, None);
+        // Nothing more fires, and asking again changes nothing.
+        assert_eq!(stepper.step(), Ok(None));
+        assert_eq!(stepper.advance(u64::MAX, true), Ok(None));
+        assert_eq!(stepper.frame(ALL), end);
+        // The way back is open, and leads here again.
+        assert!(stepper.back());
+        let before = stepper.frame(ALL);
+        assert_eq!(before.step, end.step - 1);
+        assert!(before.next.is_some());
+        assert!(stepper.step().unwrap().is_some());
+        assert_eq!(stepper.frame(ALL), end);
+    }
+
+    #[test]
+    fn a_malformed_net_stops_the_stepper_until_it_goes_back() {
+        // No rule makes a malformed net, so the halt is put in by hand.
+        let mut stepper = Stepper::load(SCRIPT).unwrap();
+        stepper.step().unwrap();
+        let before = stepper.frame(ALL);
+        stepper.failure = Some(Halt::Malformed("a test"));
+        let broken = Some("malformed net: a test".to_owned());
+        assert_eq!(stepper.frame(ALL).error, broken);
+        for _ in 0..2 {
+            assert_eq!(stepper.step(), Err(Halt::Malformed("a test")));
+            assert_eq!(stepper.frame(ALL).error, broken);
+        }
+        assert!(stepper.back());
+        assert_eq!(stepper.frame(ALL).error, None);
+        assert!(stepper.step().unwrap().is_some());
+        assert_eq!(stepper.frame(ALL), before);
+        stepper.failure = Some(Halt::Malformed("a test"));
+        stepper.reset();
+        assert_eq!(stepper.frame(ALL).error, None);
     }
 
     #[test]
