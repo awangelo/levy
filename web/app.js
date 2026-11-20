@@ -487,12 +487,15 @@ function idle() {
 }
 
 async function recover(error) {
-  stop();
+  // The session goes first: ending a run shows the frame of the one there
+  // is, and asking a broken one for it would bring the page back here.
   session = null;
   Session = null;
   frame = null;
+  stop();
   restarts += 1;
   idle();
+  ui.next.textContent = "";
   const what = `The reducer broke down on this term, most likely for lack of memory (${error?.message ?? error}).`;
   problem(`${what} Restarting it…`);
   try {
@@ -577,7 +580,7 @@ function runFrom(button, untilBeta) {
   const turn = () => {
     const began = performance.now();
     const rule = attempt(() => session.run(interactions, untilBeta) ?? null);
-    if (rule === FAILED) return;
+    if (rule === FAILED) return stop();
     if (rule === null || (untilBeta && rule === "beta")) {
       run.button.textContent = run.label;
       run = null;
