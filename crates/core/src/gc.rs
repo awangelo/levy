@@ -14,8 +14,7 @@ use crate::net::{Kind, Net, NodeId, Port};
 /// For each node index and each port of the node, whether a reading from the
 /// root can come into the node by that port.
 pub fn entries(net: &Net) -> Vec<[bool; 3]> {
-    let size = net.nodes().map(|(id, _)| id.index() + 1).max().unwrap_or(0);
-    let mut entered = vec![[false; 3]; size];
+    let mut entered = vec![[false; 3]; net.slots()];
     let mut pending: Vec<Port> = vec![net.root().principal()];
     while let Some(exit) = pending.pop() {
         // A port without a wire, as in a net still being built, leads nowhere.

@@ -43,11 +43,10 @@ pub struct Diagram {
 
 /// Places every node of `net` and lists its wires.
 pub fn layout(net: &Net) -> Diagram {
-    let size = net.nodes().map(|(id, _)| id.index() + 1).max().unwrap_or(0);
     let mut planner = Planner {
         net,
         entered: gc::entries(net),
-        placed: vec![None; size],
+        placed: vec![None; net.slots()],
         tree: HashSet::new(),
         next_column: 0.0,
     };
