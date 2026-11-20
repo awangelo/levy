@@ -293,6 +293,12 @@ impl Net {
             .unwrap_or_else(|| panic!("node {id:?} is not in the net"))
     }
 
+    fn node_mut(&mut self, id: NodeId) -> &mut Node {
+        self.cells[id.index()]
+            .as_mut()
+            .unwrap_or_else(|| panic!("node {id:?} is not in the net"))
+    }
+
     /// What the node is.
     pub fn kind(&self, id: NodeId) -> Kind {
         self.node(id).kind
@@ -300,9 +306,7 @@ impl Net {
 
     /// Changes what a node is. The new kind must have as many ports.
     pub fn set_kind(&mut self, id: NodeId, kind: Kind) {
-        let node = self.cells[id.index()]
-            .as_mut()
-            .unwrap_or_else(|| panic!("node {id:?} is not in the net"));
+        let node = self.node_mut(id);
         assert_eq!(node.kind.ports(), kind.ports(), "a node keeps its ports");
         node.kind = kind;
     }
@@ -340,10 +344,7 @@ impl Net {
     }
 
     fn set_link(&mut self, from: Port, to: Port) {
-        let node = self.cells[from.node.index()]
-            .as_mut()
-            .unwrap_or_else(|| panic!("node {:?} is not in the net", from.node));
-        node.links[usize::from(from.slot)] = Some(to);
+        self.node_mut(from.node).links[usize::from(from.slot)] = Some(to);
     }
 
     /// Makes `new` take over the wire attached to `old`.
