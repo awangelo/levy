@@ -15,8 +15,8 @@ normal order: 258294 β-steps in 27 families
 
 | Path | What it is |
 |---|---|
-| `crates/core` | The engine: terms, parser, scripts, nets, rules, machine, readback, garbage collection, Graphviz export, and the reference reducer it is checked against. No dependencies. |
-| `crates/repl` | The `levy` binary. |
+| `crates/core` | The engine: terms, parser, scripts, nets, rules, machine, readback, garbage collection, and the reference reducer it is checked against. No dependencies. |
+| `crates/repl` | The `levy` binary, with the Graphviz export behind `:dot`. |
 | `crates/web` | The stepper behind the page, the placement of nets on it, and their WebAssembly bindings. |
 | `web/` | The page that draws the nets. |
 | `examples/prelude.lam` | Church encodings to play with. |

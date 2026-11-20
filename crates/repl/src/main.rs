@@ -1,5 +1,6 @@
 //! `levy`: a REPL for Lévy-optimal λ-calculus reduction.
 
+mod dot;
 mod session;
 
 use std::io::{self, BufRead, IsTerminal, Write};

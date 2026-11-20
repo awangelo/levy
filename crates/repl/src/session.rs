@@ -4,13 +4,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use levy_core::dot::to_dot;
 use levy_core::parse::{MAX_NUMERAL, position};
 use levy_core::reference::{self, GaveUp};
 use levy_core::script::statements;
 use levy_core::term::Nodes;
 use levy_core::translate::translate;
 use levy_core::{Definitions, Halt, Machine, ParseError, Rule, ScriptError, Statement, Term};
+
+use crate::dot::to_dot;
 
 /// Work allowed per evaluation unless `:fuel` says otherwise, in steps of the
 /// machine's walk: a few seconds for ordinary terms.

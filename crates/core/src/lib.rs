@@ -23,7 +23,6 @@
 #![warn(missing_docs)]
 
 mod context;
-pub mod dot;
 pub mod gc;
 pub mod machine;
 pub mod net;

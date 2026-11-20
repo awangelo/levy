@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::net::{Kind, Net, slot};
+use levy_core::net::{Kind, Net, slot};
 
 /// Renders the net in Graphviz DOT format.
 ///
@@ -56,8 +56,8 @@ fn port_name(kind: Kind, port: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::parse;
-    use crate::translate::translate;
+    use levy_core::parse;
+    use levy_core::translate::translate;
 
     #[test]
     fn every_wire_is_drawn_once() {
