@@ -20,8 +20,10 @@
 //! reached them, as a depth-first search does. So a context is changed in
 //! place, and every change leaves a note on a trail of how to take it back: a
 //! mark is a length of the trail, and restoring it takes back the changes
-//! made since. Each change costs the same however deep its level, except
-//! that closing or opening a scope moves the indices of the scopes inside it.
+//! made since. Closing or opening a whole stack of scopes, as a stack of
+//! delimiters does, is one change. Each change costs the same however deep
+//! its level, except that closing or opening scopes moves the scopes inside
+//! them.
 
 /// Stands for no scope, no binder, or the end of a stack.
 const NONE: u32 = u32::MAX;
@@ -98,8 +100,11 @@ impl Stacks {
     }
 }
 
-/// How to take back one change. Positions are indices into `Context::open`
-/// as it stood right after the change.
+/// How to take back one change. Positions are indices into `Context::open`.
+///
+/// The trail holds one of these for nearly every node a walk passes, so they
+/// are kept to eight bytes. The rare changes that need more go on a stack of
+/// their own.
 #[derive(Clone, Copy, Debug)]
 enum Undo {
     /// This many implicit scopes were made explicit at the outer end.
@@ -110,12 +115,30 @@ enum Undo {
     Take(u32),
     /// This branch was recalled from the scope at this position.
     Recall(u32, u8),
-    /// The scope that was at this position was closed and suspended in the
-    /// one before it.
+    /// The scope at this position was closed and suspended in the one
+    /// before it.
     Leave(u32),
     /// A scope was opened right after this position: the one suspended last
     /// in the scope there if `true`, a fresh one if `false`.
     Enter(u32, bool),
+    /// Several scopes were closed or opened at once: the last of
+    /// `Context::stacked` says how.
+    Stacked,
+}
+
+const _: () = assert!(size_of::<Undo>() == 8);
+
+/// How to take back a change to several scopes in a row, as a stack of
+/// delimiters makes.
+#[derive(Clone, Copy, Debug)]
+enum Stacked {
+    /// This many scopes in a row, those that stood from this position on,
+    /// were closed: each was suspended in the one before it.
+    Leave { first: u32, height: u32 },
+    /// This many scopes were opened in a row right after this position, each
+    /// the one suspended last in the scope before it, or a fresh one once
+    /// there was none. The fresh ones come after the `resumed` ones.
+    Enter { at: u32, height: u32, resumed: u32 },
 }
 
 /// A point to come back to, as returned by [`Context::mark`].
@@ -134,6 +157,9 @@ pub struct Context {
     stacks: Stacks,
     /// The changes that may still be taken back, oldest first.
     trail: Vec<Undo>,
+    /// The details of the changes on the trail that are
+    /// [`Undo::Stacked`], oldest first.
+    stacked: Vec<Stacked>,
     /// How many changes came before the first one on the trail.
     forgotten: usize,
 }
@@ -166,12 +192,14 @@ impl Context {
             + self.scopes.len() * size_of::<Scope>()
             + self.stacks.cells.len() * size_of::<Cell>()
             + self.trail.len() * size_of::<Undo>()
+            + self.stacked.len() * size_of::<Stacked>()
     }
 
     /// Gives up the means to restore any mark taken so far.
     pub fn forget(&mut self) {
         self.forgotten += self.trail.len();
         self.trail.clear();
+        self.stacked.clear();
     }
 
     fn undo(&mut self, undo: Undo) {
@@ -212,6 +240,47 @@ impl Context {
                 } else {
                     self.scopes.pop();
                 }
+            }
+            Undo::Stacked => {
+                let stacked = self
+                    .stacked
+                    .pop()
+                    .expect("a stacked change has its details");
+                self.undo_stacked(stacked);
+            }
+        }
+    }
+
+    fn undo_stacked(&mut self, stacked: Stacked) {
+        match stacked {
+            Stacked::Leave { first, height } => {
+                let (first, height) = (first as usize, height as usize);
+                // Each comes back out of the one before it, the outermost
+                // first.
+                self.open
+                    .splice(first..first, std::iter::repeat_n(NONE, height));
+                for at in first..first + height {
+                    let around = self.open[at - 1] as usize;
+                    self.open[at] = self
+                        .stacks
+                        .pop(&mut self.scopes[around].suspended)
+                        .expect("the left scope is suspended");
+                }
+            }
+            Stacked::Enter {
+                at,
+                height,
+                resumed,
+            } => {
+                let (at, height, resumed) = (at as usize, height as usize, resumed as usize);
+                // The fresh scopes were made last, and go first.
+                self.scopes.truncate(self.scopes.len() - (height - resumed));
+                for at in (at + 1..=at + resumed).rev() {
+                    let around = self.open[at - 1] as usize;
+                    let scope = self.open[at];
+                    self.stacks.push(&mut self.scopes[around].suspended, scope);
+                }
+                self.open.drain(at + 1..=at + height);
             }
         }
     }
@@ -269,33 +338,88 @@ impl Context {
     }
 
     /// Closes `count` scopes in a row at this level, as a stack of that many
-    /// delimiters does.
+    /// delimiters does: the one at the level and those around it, each
+    /// suspended in the one around it.
     pub fn leave_scopes(&mut self, level: u32, count: u32) {
-        for _ in 0..count {
-            let at = self.reach(level, 1);
-            let scope = self.open.remove(at);
-            let around = self.open[at - 1] as usize;
-            self.stacks.push(&mut self.scopes[around].suspended, scope);
-            self.trail.push(Undo::Leave(index(at)));
+        match count {
+            0 => {}
+            // Most stacks are one delimiter high, and one scope is quicker to
+            // close on its own.
+            1 => {
+                let at = self.reach(level, 1);
+                let scope = self.open.remove(at);
+                let around = self.open[at - 1] as usize;
+                self.stacks.push(&mut self.scopes[around].suspended, scope);
+                self.trail.push(Undo::Leave(index(at)));
+            }
+            _ => {
+                // The scope that takes the outermost of them must be open
+                // too.
+                let at = self.reach(level, count);
+                let first = at + 1 - count as usize;
+                for at in (first..=at).rev() {
+                    let around = self.open[at - 1] as usize;
+                    let scope = self.open[at];
+                    self.stacks.push(&mut self.scopes[around].suspended, scope);
+                }
+                self.open.drain(first..=at);
+                self.stack(Stacked::Leave {
+                    first: index(first),
+                    height: count,
+                });
+            }
         }
     }
 
     /// Reopens `count` scopes in a row at this level, each the one suspended
-    /// last there, or a fresh one.
+    /// last in the scope before it, or a fresh one.
     pub fn enter_scopes(&mut self, level: u32, count: u32) {
-        for _ in 0..count {
-            let at = self.reach(level, 0);
+        if count == 0 {
+            return;
+        }
+        let at = self.reach(level, 0);
+        if count == 1 {
+            // As for leaving: one scope is quicker to open on its own.
             let around = self.open[at] as usize;
             let (scope, resumed) = match self.stacks.pop(&mut self.scopes[around].suspended) {
                 Some(scope) => (scope, true),
-                None => {
-                    self.scopes.push(Scope::default());
-                    (index(self.scopes.len() - 1), false)
-                }
+                None => (self.fresh(), false),
             };
             self.open.insert(at + 1, scope);
             self.trail.push(Undo::Enter(index(at), resumed));
+            return;
         }
+        let height = count as usize;
+        self.open
+            .splice(at + 1..at + 1, std::iter::repeat_n(NONE, height));
+        let mut resumed = 0;
+        for at in at + 1..=at + height {
+            let around = self.open[at - 1] as usize;
+            self.open[at] = match self.stacks.pop(&mut self.scopes[around].suspended) {
+                Some(scope) => {
+                    resumed += 1;
+                    scope
+                }
+                None => self.fresh(),
+            };
+        }
+        self.stack(Stacked::Enter {
+            at: index(at),
+            height: count,
+            resumed,
+        });
+    }
+
+    /// Logs a change to several scopes in a row.
+    fn stack(&mut self, stacked: Stacked) {
+        self.stacked.push(stacked);
+        self.trail.push(Undo::Stacked);
+    }
+
+    /// Makes a scope for a delimiter to open, and returns its index.
+    fn fresh(&mut self) -> u32 {
+        self.scopes.push(Scope::default());
+        index(self.scopes.len() - 1)
     }
 }
 
@@ -343,7 +467,9 @@ mod tests {
                 .map(|inner| self.render(inner))
                 .collect();
             let branches = self.values(scope.branches);
-            format!("{} {branches:?} {suspended:?}", scope.binder)
+            // Joined as they are: quoting them would quote the quotes of
+            // the scopes inside them again, once per level.
+            format!("{} {branches:?} [{}]", scope.binder, suspended.join(", "))
         }
 
         fn values(&self, mut top: u32) -> Vec<u32> {
@@ -451,6 +577,23 @@ mod tests {
     }
 
     #[test]
+    fn a_stack_of_scopes_is_one_change() {
+        // Seven scopes made explicit, so that nothing else is logged.
+        let mut context = Context::default().take(6, 1);
+        let mark = context.mark();
+        let before = context.reading();
+        context.leave_scopes(1, 4);
+        assert_eq!(context.mark(), mark + 1);
+        let outside = context.reading();
+        context.enter_scopes(1, 6);
+        assert_eq!(context.mark(), mark + 2);
+        context.restore(mark + 1);
+        assert_eq!(context.reading(), outside);
+        context.restore(mark);
+        assert_eq!(context.reading(), before);
+    }
+
+    #[test]
     fn restoring_a_mark_takes_back_every_change_since() {
         let mut state: u64 = 0x2545_f491_4f6c_dd1d;
         let mut random = |bound: u64| {
@@ -459,43 +602,73 @@ mod tests {
             state ^= state << 17;
             (state % bound) as u32
         };
+        // The same changes twice: as they come, and with every stack of
+        // scopes taken one scope at a time.
         let mut context = Context::default();
-        let mut saved: Vec<(Mark, Vec<String>)> = Vec::new();
+        let mut single = Context::default();
+        let mut saved: Vec<(Mark, Mark, Vec<String>)> = Vec::new();
         for step in 0..3_000 {
             if random(8) == 0 {
-                saved.push((context.mark(), context.reading()));
+                let reading = context.reading();
+                assert_eq!(single.reading(), reading, "step {step}");
+                saved.push((context.mark(), single.mark(), reading));
             }
             let level = random(6);
             match random(6) {
-                0 => context.take_branch(level, random(2) as u8 + 1),
-                1 => {
-                    context.recall_branch(level);
+                0 => {
+                    let branch = random(2) as u8 + 1;
+                    context.take_branch(level, branch);
+                    single.take_branch(level, branch);
                 }
-                2 => context.leave_scopes(level, random(3) + 1),
-                3 => context.enter_scopes(level, random(3) + 1),
-                4 => context.enter_abstraction(step),
+                1 => {
+                    assert_eq!(context.recall_branch(level), single.recall_branch(level));
+                }
+                2 => {
+                    let height = random(5) + 1;
+                    context.leave_scopes(level, height);
+                    for _ in 0..height {
+                        single.leave_scopes(level, 1);
+                    }
+                }
+                3 => {
+                    let height = random(5) + 1;
+                    context.enter_scopes(level, height);
+                    for _ in 0..height {
+                        single.enter_scopes(level, 1);
+                    }
+                }
+                4 => {
+                    context.enter_abstraction(step);
+                    single.enter_abstraction(step);
+                }
                 _ => {
                     // Go back to a random earlier mark, dropping the later
                     // ones, as the walk does.
                     if !saved.is_empty() {
                         let keep = random(saved.len() as u64) as usize;
-                        let (mark, reading) = saved[keep].clone();
+                        let (mark, single_mark, reading) = saved[keep].clone();
                         saved.truncate(keep);
                         context.restore(mark);
-                        assert_eq!(context.reading(), reading);
+                        single.restore(single_mark);
+                        assert_eq!(context.reading(), reading, "step {step}");
+                        assert_eq!(single.reading(), reading, "step {step}");
                     }
                 }
             }
         }
-        context.restore(0);
-        assert!(context.open.is_empty() && context.scopes.is_empty());
-        // Every cell is back on the free list.
-        let mut free = 0;
-        let mut cell = context.stacks.free;
-        while cell != NONE {
-            free += 1;
-            cell = context.stacks.cells[cell as usize].below;
+        assert_eq!(context.reading(), single.reading());
+        for mut context in [context, single] {
+            context.restore(0);
+            assert!(context.open.is_empty() && context.scopes.is_empty());
+            assert!(context.stacked.is_empty());
+            // Every cell is back on the free list.
+            let mut free = 0;
+            let mut cell = context.stacks.free;
+            while cell != NONE {
+                free += 1;
+                cell = context.stacks.cells[cell as usize].below;
+            }
+            assert_eq!(free, context.stacks.cells.len());
         }
-        assert_eq!(free, context.stacks.cells.len());
     }
 }
